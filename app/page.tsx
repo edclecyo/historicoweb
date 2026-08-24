@@ -1,6 +1,7 @@
 "use client";
 
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { firebaseEnabled, loadCloudHistories, loadCloudState, saveCloudHistory, saveCloudState } from "./firebase";
 
 type Area =
   | "Linguagens e Codigos"
@@ -47,6 +48,7 @@ type SchoolAccount = {
   tipo: SchoolKind;
   escola: School;
   createdAt: string;
+  mustChangePassword: boolean;
 };
 
 type Student = {
@@ -133,11 +135,27 @@ type HistoryRecord = {
   };
 };
 
+type TransferRequest = {
+  id: string;
+  fromSchoolId: string;
+  toSchoolId: string;
+  studentName: string;
+  studentBirth: string;
+  message: string;
+  status: "Solicitado" | "Em preparação" | "Enviado" | "Recebido";
+  historyId?: string;
+  receivedHistoryId?: string;
+  hiddenForSchoolIds?: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
 type AppData = {
   escola: School;
   escolas: SchoolAccount[];
   folders: Folder[];
   historicos: HistoryRecord[];
+  transferencias: TransferRequest[];
 };
 
 type AuthRole = "owner" | "school";
@@ -243,6 +261,13 @@ const defaultSchool: School = {
   assinaturaDiretor: "",
   secretario: "",
   registroSecretario: "",
+  assinaturaSecretario: "",
+};
+
+const emptySchool: School = {
+  estado: "", municipio: "", nome: "", mantenedora: "", codigo: "", credenciamento: "",
+  autorizacao: "", reconhecimento: "", parecer: "", validade: "", logo: "", carimboEscola: "",
+  diretor: "", registroDiretor: "", assinaturaDiretor: "", secretario: "", registroSecretario: "",
   assinaturaSecretario: "",
 };
 
@@ -1385,7 +1410,7 @@ const adminStorageKey = "historico-escolar-online:admin:v1";
 const migratedSchoolId = "escola-principal";
 
 function createSchoolAccount(input?: Partial<SchoolAccount> & { escola?: Partial<School> }): SchoolAccount {
-  const escola = { ...defaultSchool, ...(input?.escola ?? {}) };
+  const escola = { ...(input?.id ? defaultSchool : emptySchool), ...(input?.escola ?? {}) };
   const usuario = input && "usuario" in input
     ? input.usuario ?? ""
     : safeFileName(escola.nome || "ESCOLA").replace(/-/g, "");
@@ -1396,6 +1421,7 @@ function createSchoolAccount(input?: Partial<SchoolAccount> & { escola?: Partial
     tipo: input?.tipo || "municipal",
     escola,
     createdAt: input?.createdAt || new Date().toISOString(),
+    mustChangePassword: input?.mustChangePassword ?? !input?.id,
   };
 }
 
@@ -1501,7 +1527,7 @@ function normalizeHistory(record: HistoryRecord, fallbackSchoolId = migratedScho
 
 function loadInitialData(): AppData {
   if (typeof window === "undefined") {
-    return { escola: defaultSchool, escolas: [], folders: [], historicos: [] };
+    return { escola: defaultSchool, escolas: [], folders: [], historicos: [], transferencias: [] };
   }
   const saved = window.localStorage.getItem(storageKey);
   if (saved) {
@@ -1523,13 +1549,14 @@ function loadInitialData(): AppData {
           escolas,
           folders,
           historicos: (parsed.historicos ?? []).map((record) => normalizeHistory(record, firstSchoolId, folders)),
+          transferencias: parsed.transferencias ?? [],
         };
       }
     } catch {
       window.localStorage.removeItem(storageKey);
     }
   }
-  return { escola: defaultSchool, escolas: [], folders: [], historicos: [] };
+  return { escola: defaultSchool, escolas: [], folders: [], historicos: [], transferencias: [] };
 }
 
 function loadAdminCredentials() {
@@ -1569,7 +1596,7 @@ function storeAuthSession(session: AuthSession | null) {
 }
 
 function App() {
-  const [data, setData] = useState<AppData>({ escola: defaultSchool, escolas: [], folders: [], historicos: [] });
+  const [data, setData] = useState<AppData>({ escola: defaultSchool, escolas: [], folders: [], historicos: [], transferencias: [] });
   const [auth, setAuth] = useState<AuthSession | null>(null);
   const [adminCredentials, setAdminCredentials] = useState<AdminCredentials | null>(null);
   const [activeId, setActiveId] = useState("");
@@ -1577,7 +1604,7 @@ function App() {
   const [folderDraft, setFolderDraft] = useState("");
   const [folderYearDraft, setFolderYearDraft] = useState(String(new Date().getFullYear()));
   const [folderTeachingDraft, setFolderTeachingDraft] = useState("ENSINO FUNDAMENTAL");
-  const [view, setView] = useState<"historicos" | "editor" | "escola" | "turmas" | "alunos" | "novo">("historicos");
+  const [view, setView] = useState<"historicos" | "editor" | "escola" | "turmas" | "alunos" | "novo" | "transferencias">("historicos");
   const [yearFilter, setYearFilter] = useState("");
   const [step, setStep] = useState(0);
   const [query, setQuery] = useState("");
@@ -1601,18 +1628,50 @@ function App() {
     : [];
   const active = schoolRecords.find((item) => item.id === activeId) ?? schoolRecords[0];
   const yearOptions = Array.from(new Set(schoolFolders.map((folder) => folder.anoLetivo).filter(Boolean))).sort().reverse();
+  const schoolTransfers = currentSchoolAccount
+    ? data.transferencias.filter((request) => (request.fromSchoolId === currentSchoolAccount.id || request.toSchoolId === currentSchoolAccount.id) && !request.hiddenForSchoolIds?.includes(currentSchoolAccount.id))
+    : [];
+  const incomingTransfers = currentSchoolAccount
+    ? data.transferencias.filter((request) => request.fromSchoolId === currentSchoolAccount.id && request.status !== "Enviado")
+    : [];
+  const receivedTransferNotices = currentSchoolAccount
+    ? data.transferencias.filter((request) => request.toSchoolId === currentSchoolAccount.id && request.status === "Enviado" && !request.hiddenForSchoolIds?.includes(currentSchoolAccount.id))
+    : [];
 
   useEffect(() => {
-    const initialData = loadInitialData();
-    setData(initialData);
-    setAdminCredentials(loadAdminCredentials());
-    const session = loadAuthSession();
-    setAuth(session);
-    const firstRecord = session?.role === "school"
-      ? initialData.historicos.find((record) => record.schoolId === session.schoolId)
-      : null;
-    setActiveId(firstRecord?.id ?? "");
-    setIsReady(true);
+    let cancelled = false;
+    const initializeData = async () => {
+      const localData = loadInitialData();
+      let initialData = localData;
+      if (firebaseEnabled) {
+        try {
+          const cloudData = await loadCloudState<AppData>();
+          const cloudHistories = await loadCloudHistories<HistoryRecord>();
+          if (cloudData) {
+            const combinedHistories = [...(cloudData.historicos ?? []), ...cloudHistories];
+            initialData = {
+              ...cloudData,
+              transferencias: cloudData.transferencias ?? [],
+              historicos: Array.from(new Map(combinedHistories.map((record) => [record.id, record])).values()),
+            };
+          }
+        } catch (error) {
+          console.error("Nao foi possivel carregar os dados do Firebase.", error);
+        }
+      }
+      if (cancelled) return;
+      setData(initialData);
+      setAdminCredentials(loadAdminCredentials());
+      const session = loadAuthSession();
+      setAuth(session);
+      const firstRecord = session?.role === "school"
+        ? initialData.historicos.find((record) => record.schoolId === session.schoolId)
+        : null;
+      setActiveId(firstRecord?.id ?? "");
+      setIsReady(true);
+    };
+    void initializeData();
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -1622,16 +1681,16 @@ function App() {
       return;
     }
     if (!activeId && schoolRecords[0]) setActiveId(schoolRecords[0].id);
-    if (!schoolFolders.length && view !== "escola") setView("historicos");
+    if (!schoolFolders.length && !["escola", "turmas", "novo"].includes(view)) setView("historicos");
   }, [auth, currentSchoolAccount, activeId, schoolRecords, schoolFolders.length, view]);
 
   useEffect(() => {
     if (!isReady) return;
-    setSaveState("Salvando...");
+    setSaveState("Rascunho neste dispositivo");
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
     saveTimer.current = window.setTimeout(() => {
       window.localStorage.setItem(storageKey, JSON.stringify(data));
-      setSaveState("Salvo");
+      setSaveState("Rascunho neste dispositivo");
     }, 380);
   }, [data, isReady]);
 
@@ -1759,6 +1818,156 @@ function App() {
     }));
   };
 
+  const changeFirstPassword = (password: string) => {
+    if (auth?.role !== "school" || !auth.schoolId) return;
+    const cleanPassword = password.trim();
+    if (cleanPassword.length < 6 || cleanPassword === "123456") {
+      window.alert("Crie uma senha com pelo menos 6 caracteres e diferente da senha provisoria.");
+      return;
+    }
+    setData((current) => ({
+      ...current,
+      escolas: current.escolas.map((account) => account.id === auth.schoolId
+        ? { ...account, senha: cleanPassword, mustChangePassword: false }
+        : account),
+    }));
+  };
+
+  const persistData = async (nextData = data, successMessage = "Dados salvos") => {
+    window.localStorage.setItem(storageKey, JSON.stringify(nextData));
+    if (!firebaseEnabled) { setSaveState("Salvo neste dispositivo"); return false; }
+    try {
+      await saveCloudState({ ...nextData, historicos: [] });
+      setSaveState(successMessage);
+      return true;
+    }
+    catch (error) { console.error("Falha ao salvar.", error); setSaveState("Nao foi possivel salvar"); return false; }
+  };
+
+  const finishHistory = async (id: string, generatePdf = false) => {
+    const now = new Date().toISOString();
+    const nextData = {
+      ...data,
+      historicos: data.historicos.map((item) => item.id === id ? { ...item, status: "Emitido" as const, updatedAt: now } : item),
+      transferencias: data.transferencias.map((request) => request.historyId === id ? { ...request, status: "Enviado" as const, updatedAt: now } : request),
+    };
+    setData(nextData);
+    const history = nextData.historicos.find((item) => item.id === id);
+    let saved = await persistData(nextData, "Salvando histórico...");
+    if (saved && history) {
+      try {
+        const { fotosHistorico: _photos, ...cloudHistory } = history;
+        await saveCloudHistory(id, cloudHistory);
+        setSaveState("Histórico salvo");
+      } catch (error) {
+        console.error("Falha ao salvar o histórico.", error);
+        setSaveState("Não foi possível salvar o histórico");
+        saved = false;
+      }
+    }
+    if (saved && generatePdf) savePdfForRecord(id);
+    if (saved && !generatePdf) {
+      window.alert("Histórico salvo com sucesso.");
+      setView("historicos");
+    }
+  };
+
+  const sendExistingHistory = async (requestId: string, historyId: string) => {
+    const history = schoolRecords.find((item) => item.id === historyId);
+    if (!history) return;
+    const now = new Date().toISOString();
+    const nextData = {
+      ...data,
+      transferencias: data.transferencias.map((request) => request.id === requestId ? { ...request, historyId, status: "Enviado" as const, updatedAt: now } : request),
+    };
+    setData(nextData);
+    await saveCloudHistory(history.id, history);
+    await persistData(nextData, "Histórico enviado");
+    window.alert("Histórico enviado para a escola solicitante.");
+  };
+
+  const receiveTransferHistory = async (requestId: string, folderId: string) => {
+    if (!currentSchoolAccount || !folderId) return;
+    const request = data.transferencias.find((item) => item.id === requestId && item.toSchoolId === currentSchoolAccount.id);
+    const source = data.historicos.find((item) => item.id === request?.historyId);
+    const folder = schoolFolders.find((item) => item.id === folderId);
+    if (!request || !source || !folder) {
+      window.alert("Não foi possível localizar o histórico enviado.");
+      return;
+    }
+    const received: HistoryRecord = { ...source, id: crypto.randomUUID(), schoolId: currentSchoolAccount.id, folderId, anoLetivo: folder.anoLetivo, updatedAt: new Date().toISOString() };
+    const nextData = {
+      ...data,
+      historicos: [received, ...data.historicos],
+      transferencias: data.transferencias.map((item) => item.id === requestId ? { ...item, status: "Recebido" as const, receivedHistoryId: received.id, updatedAt: new Date().toISOString() } : item),
+    };
+    setData(nextData);
+    await saveCloudHistory(received.id, received);
+    await persistData(nextData, "Histórico recebido");
+    setActiveFolderId(folderId);
+    setView("historicos");
+    window.alert("Histórico recebido e salvo na turma escolhida.");
+  };
+
+  const hideTransferMessage = async (requestId: string) => {
+    if (!currentSchoolAccount) return;
+    const nextData = {
+      ...data,
+      transferencias: data.transferencias.map((request) => request.id === requestId
+        ? { ...request, hiddenForSchoolIds: [...new Set([...(request.hiddenForSchoolIds ?? []), currentSchoolAccount.id])] }
+        : request),
+    };
+    setData(nextData);
+    await persistData(nextData, "Mensagem removida");
+  };
+
+  const requestTransfer = async (input: Pick<TransferRequest, "fromSchoolId" | "studentName" | "studentBirth" | "message">) => {
+    if (!currentSchoolAccount || input.fromSchoolId === currentSchoolAccount.id) return;
+    const now = new Date().toISOString();
+    const request: TransferRequest = {
+      id: crypto.randomUUID(),
+      fromSchoolId: input.fromSchoolId,
+      toSchoolId: currentSchoolAccount.id,
+      studentName: uppercaseInput(input.studentName),
+      studentBirth: input.studentBirth,
+      message: input.message.trim() || `O aluno ${uppercaseInput(input.studentName)} foi transferido para nossa escola. Solicitamos o histórico escolar.`,
+      status: "Solicitado",
+      createdAt: now,
+      updatedAt: now,
+    };
+    const nextData = { ...data, transferencias: [request, ...data.transferencias] };
+    setData(nextData);
+    await persistData(nextData, "Solicitação enviada");
+  };
+
+  const prepareTransferHistory = async (requestId: string) => {
+    if (!currentSchoolAccount) return;
+    const request = data.transferencias.find((item) => item.id === requestId && item.fromSchoolId === currentSchoolAccount.id);
+    if (!request) return;
+    let folder = schoolFolders.find((item) => item.nome === "TRANSFERÊNCIAS");
+    const folders = [...data.folders];
+    if (!folder) {
+      folder = { id: crypto.randomUUID(), schoolId: currentSchoolAccount.id, anoLetivo: String(new Date().getFullYear()), nome: "TRANSFERÊNCIAS", tipoEnsino: "ENSINO FUNDAMENTAL" };
+      folders.push(folder);
+    }
+    const history = createHistory(currentSchool, currentSchoolAccount.id, folder);
+    history.aluno.nome = request.studentName;
+    history.aluno.nascimento = request.studentBirth;
+    const now = new Date().toISOString();
+    const nextData = {
+      ...data,
+      folders,
+      historicos: [history, ...data.historicos],
+      transferencias: data.transferencias.map((item) => item.id === requestId ? { ...item, status: "Em preparação" as const, historyId: history.id, updatedAt: now } : item),
+    };
+    setData(nextData);
+    await persistData(nextData, "Preparação iniciada");
+    setActiveFolderId(folder.id);
+    setActiveId(history.id);
+    setStep(0);
+    setView("editor");
+  };
+
   const updateActive = (updater: (record: HistoryRecord) => HistoryRecord) => {
     setData((current) => ({
       ...current,
@@ -1809,7 +2018,7 @@ function App() {
     const folder = schoolFolders.find((item) => item.id === activeFolderId);
     if (!folder) {
       window.alert("Crie ou selecione primeiro o ano letivo e a turma da escola.");
-      setView("historicos");
+      setView("turmas");
       return;
     }
     const candidate = schoolRecords.find(
@@ -1881,6 +2090,10 @@ function App() {
         record.id === id ? { ...record, status: "Emitido", updatedAt: new Date().toISOString() } : record,
       ),
     }));
+    if (active?.id === id && view === "editor") {
+      window.print();
+      return;
+    }
     setPrintBatch(null);
     setActiveId(id);
     setView("editor");
@@ -2048,27 +2261,36 @@ function App() {
     );
   }
 
+
+  if (currentSchoolAccount?.mustChangePassword) {
+    return <FirstAccessPassword schoolName={currentSchool.nome} onSave={changeFirstPassword} onLogout={logout} />;
+  }
+
   return (
     <main className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <span className="brand-mark">H</span>
+          <span className="brand-mark">HE</span>
           <div>
-            <strong>Historico Online</strong>
-            <small>Login da escola</small>
+            <strong>Histórico Escolar</strong>
+            <small>Gestão educacional</small>
           </div>
         </div>
         <button className={view === "historicos" ? "nav active" : "nav"} onClick={() => setView("historicos")}>
-          <span>[ ]</span> Historicos
+          <span className="nav-icon">▦</span> Históricos
         </button>
         <button className={view === "alunos" ? "nav active" : "nav"} onClick={() => setView("alunos")}>
-          <span>@</span> Alunos
+          <span className="nav-icon">◎</span> Alunos
+        </button>
+        <button className={view === "transferencias" ? "nav active" : "nav"} onClick={() => setView("transferencias")}>
+          <span className="nav-icon">⇄</span> Transferências
+          {incomingTransfers.length > 0 && <span className="nav-badge">{incomingTransfers.length}</span>}
         </button>
         <button className={view === "novo" || view === "editor" ? "nav active" : "nav"} onClick={() => setView("novo")}>
-          <span>+</span> Novo Historico
+          <span className="nav-icon">＋</span> Novo histórico
         </button>
         <button className={view === "turmas" ? "nav active" : "nav"} onClick={() => setView("turmas")}>
-          <span>+</span> Criar Turma
+          <span className="nav-icon">◇</span> Turmas
         </button>
         <div className="sidebar-rule" />
         <button
@@ -2077,7 +2299,7 @@ function App() {
             setView("escola");
           }}
         >
-          <span>*</span> Dados da Escola
+          <span className="nav-icon">⌂</span> Dados da escola
         </button>
         <div className="sidebar-rule" />
         <div className="folder-panel">
@@ -2106,6 +2328,7 @@ function App() {
               view === "escola" ? "Cadastro da Escola" :
               view === "turmas" ? "Turmas e Ano Letivo" :
               view === "alunos" ? "Arquivo de Alunos" :
+              view === "transferencias" ? "Transferências entre Escolas" :
               view === "novo" ? "Criar Historico" :
               "Historico Escolar"
             }</p>
@@ -2127,13 +2350,25 @@ function App() {
               </label>
             )}
             {view === "editor" && active && (
-              <>
-                <button onClick={() => { setPrintBatch(null); window.print(); }}>Imprimir</button>
-                <button className="primary" onClick={() => savePdfForRecord(active.id)}>Salvar PDF no PC</button>
-              </>
+              <button className="primary" onClick={() => savePdfForRecord(active.id)}>Gerar PDF</button>
             )}
           </div>
         </header>
+
+        {incomingTransfers.length > 0 && view !== "transferencias" && (
+          <button className="transfer-alert-card" type="button" onClick={() => setView("transferencias")}>
+            <span className="transfer-alert-icon">!</span>
+            <span><strong>{data.escolas.find((school) => school.id === incomingTransfers[0].toSchoolId)?.escola.nome || "Outra escola"}</strong> solicitou o histórico de <strong>{incomingTransfers[0].studentName}</strong>.</span>
+            <span className="transfer-alert-action">Ver solicitação →</span>
+          </button>
+        )}
+        {receivedTransferNotices.length > 0 && view !== "transferencias" && (
+          <button className="transfer-alert-card received" type="button" onClick={() => setView("transferencias")}>
+            <span className="transfer-alert-icon">✓</span>
+            <span><strong>{data.escolas.find((school) => school.id === receivedTransferNotices[0].fromSchoolId)?.escola.nome || "Escola de origem"}</strong> enviou o histórico de <strong>{receivedTransferNotices[0].studentName}</strong>.</span>
+            <span className="transfer-alert-action">Receber histórico →</span>
+          </button>
+        )}
 
         {view === "historicos" && (
           <HistoryList
@@ -2210,7 +2445,23 @@ function App() {
           />
         )}
 
-        {view === "escola" && <SchoolSettings school={currentSchool} updateSchool={updateSchool} />}
+        {view === "transferencias" && currentSchoolAccount && (
+          <TransfersScreen
+            currentSchool={currentSchoolAccount}
+            schools={data.escolas}
+            requests={schoolTransfers}
+            folders={schoolFolders}
+            histories={schoolRecords}
+            requestTransfer={requestTransfer}
+            prepareHistory={(id) => void prepareTransferHistory(id)}
+            sendExisting={(requestId, historyId) => void sendExistingHistory(requestId, historyId)}
+            receiveHistory={(requestId, folderId) => void receiveTransferHistory(requestId, folderId)}
+            deleteMessage={(id) => void hideTransferMessage(id)}
+            openHistory={(id) => { setActiveId(id); setView("editor"); }}
+          />
+        )}
+
+        {view === "escola" && <SchoolSettings school={currentSchool} updateSchool={updateSchool} onSave={() => void persistData(data, "Dados da escola salvos")} />}
 
         {view === "editor" && active && (
           <div className="editor-grid">
@@ -2233,7 +2484,7 @@ function App() {
                 updateActive={updateActive}
                 updateSchool={updateSchool}
                 setStep={setStep}
-                savePdfForRecord={savePdfForRecord}
+                finishHistory={finishHistory}
               />
             </section>
 
@@ -2292,10 +2543,10 @@ function LoginScreen({
     <main className="login-shell">
       <section className="login-card">
         <div className="login-brand">
-          <span className="brand-mark">H</span>
+          <span className="brand-mark">HE</span>
           <div>
-            <p>Sistema</p>
-            <h1>Historico Online</h1>
+            <p>Plataforma de gestão escolar</p>
+            <h1>Histórico Escolar Online</h1>
           </div>
         </div>
 
@@ -2306,7 +2557,7 @@ function LoginScreen({
               onLoginSchool({ usuario: schoolUser, senha: schoolPassword });
             }}
           >
-            <h2>Login da escola</h2>
+            <div className="login-heading"><span>Portal da escola</span><h2>Acesse sua unidade</h2><p>Consulte alunos, turmas e emita históricos escolares.</p></div>
             <label>
               <span>Usuario da escola</span>
               <input value={schoolUser} onChange={(event) => setSchoolUser(uppercaseInput(event.target.value))} placeholder="ESCOLA001" />
@@ -2315,7 +2566,7 @@ function LoginScreen({
               <span>Senha</span>
               <input type="password" value={schoolPassword} onChange={(event) => setSchoolPassword(event.target.value)} />
             </label>
-            <button className="primary" type="submit">Entrar na escola</button>
+            <button className="primary login-submit" type="submit">Entrar no portal <span>→</span></button>
           </form>
 
           <form
@@ -2326,7 +2577,7 @@ function LoginScreen({
               else onCreateAdmin(credentials);
             }}
           >
-            <h2>{hasAdmin ? "Login do dono" : "Criar dono do sistema"}</h2>
+            <div className="login-heading"><span>Área restrita</span><h2>{hasAdmin ? "Superadministrador" : "Criar superadministrador"}</h2><p>Gerencie as escolas e os acessos da plataforma.</p></div>
             <label>
               <span>Usuario do dono</span>
               <input value={adminUser} onChange={(event) => setAdminUser(uppercaseInput(event.target.value))} />
@@ -2335,9 +2586,31 @@ function LoginScreen({
               <span>Senha</span>
               <input type="password" value={adminPassword} onChange={(event) => setAdminPassword(event.target.value)} />
             </label>
-            <button type="submit">{hasAdmin ? "Entrar como dono" : "Criar dono"}</button>
+            <button className="login-submit secondary" type="submit">{hasAdmin ? "Acessar administração" : "Criar acesso principal"} <span>→</span></button>
           </form>
         </div>
+      </section>
+    </main>
+  );
+}
+
+function FirstAccessPassword({ schoolName, onSave, onLogout }: { schoolName: string; onSave: (password: string) => void; onLogout: () => void }) {
+  const [password, setPassword] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  return (
+    <main className="login-shell first-access-shell">
+      <section className="first-access-card">
+        <div className="security-badge">✓</div>
+        <span className="eyebrow">Primeiro acesso</span>
+        <h1>Proteja a conta da escola</h1>
+        <p>{upper(schoolName)}</p>
+        <div className="security-notice">A senha provisória <strong>123456</strong> deve ser substituída antes de continuar.</div>
+        <form onSubmit={(event) => { event.preventDefault(); if (password !== confirmation) { window.alert("As senhas nao conferem."); return; } onSave(password); }}>
+          <label><span>Nova senha</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" /></label>
+          <label><span>Confirmar nova senha</span><input type="password" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="new-password" /></label>
+          <button className="primary" type="submit">Salvar senha e continuar</button>
+          <button type="button" onClick={onLogout}>Voltar ao login</button>
+        </form>
       </section>
     </main>
   );
@@ -2358,9 +2631,9 @@ function OwnerDashboard({
 }) {
   const [draft, setDraft] = useState(() => createSchoolAccount({
     usuario: "",
-    senha: "",
+    senha: "123456",
     tipo: "municipal",
-    escola: { ...defaultSchool, nome: "", logo: "" },
+    escola: { ...emptySchool },
   }));
 
   const updateDraftSchool = (patch: Partial<School>) => {
@@ -2371,16 +2644,17 @@ function OwnerDashboard({
     <main className="app-shell admin-shell">
       <aside className="sidebar">
         <div className="brand">
-          <span className="brand-mark">H</span>
+          <span className="brand-mark">HE</span>
           <div>
-            <strong>Historico Online</strong>
-            <small>Dono do sistema</small>
+            <strong>Histórico Escolar</strong>
+            <small>Superadministração</small>
           </div>
         </div>
-        <button className="nav active"><span>*</span> Escolas</button>
+        <button className="nav active"><span className="nav-icon">⌂</span> Escolas</button>
+        <button className="nav"><span className="nav-icon">◎</span> Visão geral</button>
         <div className="firebase-note">
-          <strong>ADMINISTRADOR</strong>
-          <span>Cria e controla as contas das escolas.</span>
+          <strong>SUPERADMINISTRADOR</strong>
+          <span>Acesso exclusivo para controlar escolas e credenciais.</span>
           <button type="button" onClick={onLogout}>Sair</button>
         </div>
       </aside>
@@ -2388,8 +2662,8 @@ function OwnerDashboard({
       <section className="workspace">
         <header className="topbar">
           <div>
-            <p>Painel central</p>
-            <h1>Historico Online</h1>
+            <p>Central de administração</p>
+            <h1>Gestão de escolas</h1>
           </div>
           <span className="save-state">{saveState === "Salvo" ? "OK Salvo" : saveState}</span>
         </header>
@@ -2413,8 +2687,9 @@ function OwnerDashboard({
               <input value={draft.usuario} onChange={(event) => setDraft((current) => ({ ...current, usuario: uppercaseInput(event.target.value) }))} />
             </label>
             <label>
-              <span>Senha da escola</span>
-              <input type="password" value={draft.senha} onChange={(event) => setDraft((current) => ({ ...current, senha: event.target.value }))} />
+              <span>Senha provisória</span>
+              <input value="123456" readOnly aria-label="Senha provisoria padrao" />
+              <small className="field-help">A escola deverá criar uma nova senha no primeiro acesso.</small>
             </label>
             <div className="school-kind">
               <span>Rede da escola</span>
@@ -2434,9 +2709,9 @@ function OwnerDashboard({
               onCreateSchool(draft);
               setDraft(createSchoolAccount({
                 usuario: "",
-                senha: "",
+                senha: "123456",
                 tipo: "municipal",
-                escola: { ...defaultSchool, nome: "", logo: "" },
+                escola: { ...emptySchool },
               }));
             }}
           >
@@ -2455,7 +2730,7 @@ function OwnerDashboard({
                 <th>Censo</th>
                 <th>Usuario</th>
                 <th>Rede</th>
-                <th>Senha</th>
+                <th>Acesso</th>
               </tr>
             </thead>
             <tbody>
@@ -2480,7 +2755,7 @@ function OwnerDashboard({
                     </select>
                   </td>
                   <td>
-                    <input type="password" value={account.senha} onChange={(event) => onUpdateSchool(account.id, { senha: event.target.value })} />
+                    <button type="button" className="reset-password" onClick={() => onUpdateSchool(account.id, { senha: "123456", mustChangePassword: true })}>Redefinir para 123456</button>
                   </td>
                 </tr>
               ))}
@@ -2510,6 +2785,13 @@ function transferYearFor(record: HistoryRecord) {
 
 function isTransferredRecord(record: HistoryRecord) {
   return years.some((year) => upper(record.resultados[year] || "").includes("TRANSFER"));
+}
+
+function lastAttendedYear(record: HistoryRecord) {
+  return years.find((year) => {
+    const result = upper(record.resultados[year] || "");
+    return result.includes("CURSANDO") || result.includes("TRANSFERIDO");
+  }) ?? 9;
 }
 
 function NewHistoryScreen({
@@ -2665,7 +2947,7 @@ function StudentsArchive({
   const [query, setQuery] = useState("");
   const [year, setYear] = useState("");
   const [folderId, setFolderId] = useState("");
-  const [status, setStatus] = useState("transferidos");
+  const [status, setStatus] = useState("todos");
   const yearsList = Array.from(new Set(records.map((record) => transferYearFor(record)).filter(Boolean))).sort().reverse();
   const filteredRecords = records.filter((record) => {
     const folder = folders.find((item) => item.id === record.folderId);
@@ -2673,7 +2955,7 @@ function StudentsArchive({
     const matchesQuery = !query || record.aluno.nome.toLocaleLowerCase("pt-BR").includes(query.toLocaleLowerCase("pt-BR"));
     const matchesYear = !year || transferYear === year || record.anoLetivo === year;
     const matchesFolder = !folderId || record.folderId === folderId;
-    const matchesStatus = status === "todos" || (status === "transferidos" ? isTransferredRecord(record) : record.status === "Emitido");
+    const matchesStatus = status === "todos" || record.status === "Emitido";
     return matchesQuery && matchesYear && matchesFolder && matchesStatus;
   });
 
@@ -2681,7 +2963,7 @@ function StudentsArchive({
     <section className="list-screen">
       <div className="panel-heading">
         <h2>Alunos</h2>
-        <p>Arquivo de pesquisa dos historicos feitos e alunos transferidos.</p>
+        <p>Lista automática dos alunos que possuem histórico cadastrado.</p>
       </div>
       <div className="archive-filters">
         <label>
@@ -2705,7 +2987,6 @@ function StudentsArchive({
         <label>
           <span>Arquivo</span>
           <select value={status} onChange={(event) => setStatus(event.target.value)}>
-            <option value="transferidos">Transferidos</option>
             <option value="emitidos">Historicos feitos</option>
             <option value="todos">Todos</option>
           </select>
@@ -2728,10 +3009,7 @@ function StudentsArchive({
               <td>{folderTitle(folders.find((folder) => folder.id === record.folderId))}</td>
               <td>{transferYearFor(record) || "-"}</td>
               <td><span className="status">{isTransferredRecord(record) ? "TRANSFERIDO" : record.status}</span></td>
-              <td className="row-actions">
-                <button onClick={() => edit(record.id)}>Abrir</button>
-                <button onClick={() => savePdfForRecord(record.id)}>Salvar PDF</button>
-              </td>
+              <td><ActionMenu actions={[{ label: "Abrir histórico", run: () => edit(record.id) }, { label: "Salvar PDF", run: () => savePdfForRecord(record.id) }]} /></td>
             </tr>
           ))}
           {!filteredRecords.length && (
@@ -3048,13 +3326,13 @@ function HistoryList({
                   <td>{folder?.tipoEnsino || "-"}</td>
                   <td>{new Date(record.updatedAt).toLocaleString("pt-BR")}</td>
                   <td><span className="status">{isTransferredRecord(record) ? "TRANSFERIDO" : record.status}</span></td>
-                  <td className="row-actions">
-                    <button onClick={() => edit(record.id)}>Editar</button>
-                    <button onClick={() => edit(record.id)}>Visualizar</button>
-                    <button onClick={() => savePdfForRecord(record.id)}>Salvar PDF</button>
-                    <button onClick={() => printRecord(record.id)}>Imprimir</button>
-                    <button onClick={() => deleteRecord(record.id)}>Excluir</button>
-                  </td>
+                  <td><ActionMenu actions={[
+                    { label: "Editar histórico", run: () => edit(record.id) },
+                    { label: "Visualizar", run: () => edit(record.id) },
+                    { label: "Salvar PDF", run: () => savePdfForRecord(record.id) },
+                    { label: "Imprimir", run: () => printRecord(record.id) },
+                    { label: "Excluir", run: () => deleteRecord(record.id), danger: true },
+                  ]} /></td>
                 </tr>
               );
             })()
@@ -3070,7 +3348,122 @@ function HistoryList({
   );
 }
 
-function SchoolSettings({ school, updateSchool }: { school: School; updateSchool: (patch: Partial<School>) => void }) {
+function ActionMenu({ actions }: { actions: Array<{ label: string; run: () => void; danger?: boolean }> }) {
+  return (
+    <details className="action-menu">
+      <summary aria-label="Abrir acoes">•••</summary>
+      <div className="action-menu-popover">
+        {actions.map((action) => (
+          <button key={action.label} type="button" className={action.danger ? "danger" : ""} onClick={(event) => {
+            action.run();
+            event.currentTarget.closest("details")?.removeAttribute("open");
+          }}>{action.label}</button>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function TransfersScreen({
+  currentSchool,
+  schools,
+  requests,
+  folders,
+  histories,
+  requestTransfer,
+  prepareHistory,
+  sendExisting,
+  receiveHistory,
+  deleteMessage,
+  openHistory,
+}: {
+  currentSchool: SchoolAccount;
+  schools: SchoolAccount[];
+  requests: TransferRequest[];
+  folders: Folder[];
+  histories: HistoryRecord[];
+  requestTransfer: (input: Pick<TransferRequest, "fromSchoolId" | "studentName" | "studentBirth" | "message">) => Promise<void>;
+  prepareHistory: (id: string) => void;
+  sendExisting: (requestId: string, historyId: string) => void;
+  receiveHistory: (requestId: string, folderId: string) => void;
+  deleteMessage: (id: string) => void;
+  openHistory: (id: string) => void;
+}) {
+  const availableSchools = schools.filter((school) => school.id !== currentSchool.id);
+  const [fromSchoolId, setFromSchoolId] = useState(availableSchools[0]?.id ?? "");
+  const [studentName, setStudentName] = useState("");
+  const [studentBirth, setStudentBirth] = useState("");
+  const [message, setMessage] = useState("");
+  const [sending, setSending] = useState(false);
+  const [selectedHistory, setSelectedHistory] = useState<Record<string, string>>({});
+  const [selectedFolder, setSelectedFolder] = useState<Record<string, string>>({});
+
+  const schoolName = (id: string) => schools.find((school) => school.id === id)?.escola.nome || "ESCOLA";
+  const incoming = requests.filter((request) => request.fromSchoolId === currentSchool.id);
+  const outgoing = requests.filter((request) => request.toSchoolId === currentSchool.id);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!fromSchoolId || !studentName.trim()) return;
+    setSending(true);
+    await requestTransfer({ fromSchoolId, studentName, studentBirth, message });
+    setStudentName("");
+    setStudentBirth("");
+    setMessage("");
+    setSending(false);
+  };
+
+  return (
+    <section className="transfers-screen">
+      <div className="transfer-intro">
+        <div><span className="eyebrow">Comunicação escolar</span><h2>Solicitação de histórico</h2><p>Peça o histórico à escola de origem e acompanhe o atendimento.</p></div>
+        <span className="transfer-count">{requests.length} solicitações</span>
+      </div>
+
+      <form className="transfer-form" onSubmit={submit}>
+        <div className="panel-heading"><h3>Nova solicitação</h3><p>Informe de qual escola o aluno veio.</p></div>
+        <div className="form-grid">
+          <label className="wide"><span>Escola de origem</span><select value={fromSchoolId} onChange={(event) => setFromSchoolId(event.target.value)} required><option value="">Selecione a escola</option>{availableSchools.map((school) => <option key={school.id} value={school.id}>{upper(school.escola.nome || school.usuario)}</option>)}</select></label>
+          <Field label="Nome completo do aluno" value={studentName} onChange={setStudentName} wide />
+          <Field label="Data de nascimento" type="date" value={studentBirth} onChange={setStudentBirth} />
+          <label className="wide"><span>Mensagem para a escola</span><textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="Escreva uma mensagem para a escola de origem." /></label>
+        </div>
+        <button className="primary" type="submit" disabled={sending || !availableSchools.length}>{sending ? "Enviando..." : "Enviar solicitação"}</button>
+        {!availableSchools.length && <small className="field-help">Cadastre outra escola antes de enviar uma solicitação.</small>}
+      </form>
+
+      <div className="transfer-columns">
+        <section className="transfer-list">
+          <div className="panel-heading"><h3>Pedidos recebidos</h3><p>Históricos que sua escola precisa providenciar.</p></div>
+          {incoming.map((request) => {
+            const matching = histories.filter((history) => upper(history.aluno.nome) === upper(request.studentName));
+            return <article className={`transfer-card ${request.status === "Solicitado" ? "attention" : ""}`} key={request.id}>
+              <div className="transfer-card-head"><span className={`transfer-status status-${safeFileName(request.status)}`}>{request.status}</span><time>{new Date(request.createdAt).toLocaleDateString("pt-BR")}</time></div>
+              <h4>{request.studentName}</h4><p><strong>{schoolName(request.toSchoolId)}</strong> solicitou o histórico deste aluno.</p>{request.message && <blockquote>{request.message}</blockquote>}
+              {request.status === "Solicitado" && matching.length > 0 && <div className="transfer-send-existing"><select value={selectedHistory[request.id] ?? matching[0].id} onChange={(event) => setSelectedHistory((current) => ({ ...current, [request.id]: event.target.value }))}>{matching.map((history) => <option key={history.id} value={history.id}>{history.aluno.nome} — {history.anoLetivo || history.codigo}</option>)}</select><button className="primary" onClick={() => sendExisting(request.id, selectedHistory[request.id] ?? matching[0].id)}>Enviar histórico já pronto</button></div>}
+              <div className="transfer-card-actions">{request.status === "Solicitado" && <button onClick={() => prepareHistory(request.id)}>Preparar novo histórico</button>}{request.historyId && <button onClick={() => openHistory(request.historyId!)}>{request.status === "Enviado" || request.status === "Recebido" ? "Ver histórico enviado" : "Continuar preenchimento"}</button>}<button className="danger" onClick={() => deleteMessage(request.id)}>Apagar mensagem</button></div>
+            </article>;
+          })}
+          {!incoming.length && <div className="empty-transfer">Nenhum pedido recebido.</div>}
+        </section>
+        <section className="transfer-list">
+          <div className="panel-heading"><h3>Pedidos enviados</h3><p>Acompanhe e receba os históricos solicitados.</p></div>
+          {outgoing.map((request) => <article className={`transfer-card ${request.status === "Enviado" ? "attention" : ""}`} key={request.id}>
+            <div className="transfer-card-head"><span className={`transfer-status status-${safeFileName(request.status)}`}>{request.status}</span><time>{new Date(request.createdAt).toLocaleDateString("pt-BR")}</time></div>
+            <h4>{request.studentName}</h4><p>Solicitado para <strong>{schoolName(request.fromSchoolId)}</strong>.</p>
+            <small>{request.status === "Solicitado" ? "Aguardando a escola de origem iniciar o atendimento." : request.status === "Em preparação" ? "A escola de origem está preparando o histórico." : request.status === "Enviado" ? "Histórico recebido. Escolha uma turma para arquivar." : "Histórico arquivado na escola."}</small>
+            {request.status === "Enviado" && <div className="transfer-receive"><select value={selectedFolder[request.id] ?? ""} onChange={(event) => setSelectedFolder((current) => ({ ...current, [request.id]: event.target.value }))}><option value="">Escolha a turma</option>{folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.anoLetivo} — {folder.nome}</option>)}</select><button className="primary" disabled={!selectedFolder[request.id]} onClick={() => receiveHistory(request.id, selectedFolder[request.id])}>Receber e arquivar</button></div>}
+            {request.status === "Recebido" && request.receivedHistoryId && <button onClick={() => openHistory(request.receivedHistoryId!)}>Abrir histórico recebido</button>}
+            <button className="danger" onClick={() => deleteMessage(request.id)}>Apagar mensagem</button>
+          </article>)}
+          {!outgoing.length && <div className="empty-transfer">Nenhum pedido enviado.</div>}
+        </section>
+      </div>
+    </section>
+  );
+}
+
+function SchoolSettings({ school, updateSchool, onSave }: { school: School; updateSchool: (patch: Partial<School>) => void; onSave: () => void }) {
   const uploadSchoolImage = async (key: "logo" | "carimboEscola" | "assinaturaDiretor" | "assinaturaSecretario", file?: File) => {
     const image = await imageFileToTransparentPng(file);
     if (!image) return;
@@ -3154,7 +3547,9 @@ function SchoolSettings({ school, updateSchool }: { school: School; updateSchool
           )}
         </label>
       </div>
-      <button className="primary">Salvar dados da escola</button>
+      <div className="settings-savebar">
+        <button className="primary" type="button" onClick={onSave}>Salvar dados da escola</button>
+      </div>
     </section>
   );
 }
@@ -3179,7 +3574,7 @@ function StepForm({
   updateActive,
   updateSchool,
   setStep,
-  savePdfForRecord,
+  finishHistory,
 }: {
   record: HistoryRecord;
   school: School;
@@ -3187,7 +3582,7 @@ function StepForm({
   updateActive: (updater: (record: HistoryRecord) => HistoryRecord) => void;
   updateSchool: (patch: Partial<School>) => void;
   setStep: (step: number) => void;
-  savePdfForRecord: (id: string) => void;
+  finishHistory: (id: string, generatePdf?: boolean) => Promise<void>;
 }) {
   const updateStudent = (patch: Partial<Student>) => updateActive((item) => ({ ...item, aluno: { ...item.aluno, ...patch } }));
   const updateLegal = (patch: Partial<SchoolLegal>) => updateActive((item) => ({ ...item, dadosLegais: { ...item.dadosLegais, ...patch } }));
@@ -3236,16 +3631,15 @@ function StepForm({
         </>
       )}
 
-      {step === 2 && <NotesForm record={record} updateActive={updateActive} />}
+      {step === 2 && <NotesForm record={record} school={school} updateActive={updateActive} />}
       {step === 3 && <WorkloadForm record={record} updateActive={updateActive} />}
       {step === 4 && <StudiesForm record={record} updateActive={updateActive} />}
       {step === 5 && <CertificateForm record={record} school={school} updateActive={updateActive} updateSchool={updateSchool} />}
       {step === 6 && (
         <Conference
           record={record}
-          updateActive={updateActive}
           setStep={setStep}
-          savePdfForRecord={savePdfForRecord}
+          finishHistory={finishHistory}
         />
       )}
 
@@ -3266,7 +3660,7 @@ function Field({ label, value, onChange, type = "text", wide = false, disabled =
   );
 }
 
-function NotesForm({ record, updateActive }: { record: HistoryRecord; updateActive: (updater: (record: HistoryRecord) => HistoryRecord) => void }) {
+function NotesForm({ record, school, updateActive }: { record: HistoryRecord; school: School; updateActive: (updater: (record: HistoryRecord) => HistoryRecord) => void }) {
   const tableRef = useRef<HTMLDivElement>(null);
   const [newComponent, setNewComponent] = useState({ nome: "", area: "Parte Diversificada" as Area, inicio: 1, fim: 9, avaliativo: true });
 
@@ -3321,7 +3715,7 @@ function NotesForm({ record, updateActive }: { record: HistoryRecord; updateActi
                   <small>{component.area} - {component.avaliativo ? "Avaliativo" : "Nao avaliativo"}</small>
                 </td>
                 {years.map((year, colIndex) => {
-                  const disabled = year < component.inicio || year > component.fim;
+                  const disabled = year < component.inicio || year > component.fim || year > lastAttendedYear(record);
                   return (
                     <td key={year}>
                       <input
@@ -3380,7 +3774,29 @@ function NotesForm({ record, updateActive }: { record: HistoryRecord; updateActi
         {years.map((year) => (
           <label key={year}>
             <span>{year}o Ano</span>
-            <select value={record.resultados[year] ?? ""} onChange={(event) => updateActive((item) => ({ ...item, resultados: { ...item.resultados, [year]: uppercaseInput(event.target.value) } }))}>
+            <select value={record.resultados[year] ?? ""} onChange={(event) => {
+              const value = uppercaseInput(event.target.value);
+              updateActive((item) => {
+                const terminal = value === "CURSANDO" || value === "TRANSFERIDO";
+                const resultados = { ...item.resultados, [year]: value };
+                const cargaHoraria = { ...item.cargaHoraria };
+                const notas = Object.fromEntries(Object.entries(item.notas).map(([id, row]) => [id, { ...row }]));
+                const estudos = item.estudos.map((study, index) => {
+                  const schoolYear = index + 1;
+                  if (terminal && schoolYear > year) return { ...study, ativo: false, ano: "-", escola: "-", cidade: "-", estado: "-" };
+                  if (terminal && schoolYear === year) return { ...study, ativo: true, ano: item.anoLetivo, escola: upper(school.nome), cidade: upper(school.municipio), estado: upper(school.estado) };
+                  return study;
+                });
+                if (terminal) {
+                  years.filter((nextYear) => nextYear > year).forEach((nextYear) => {
+                    resultados[nextYear] = "-";
+                    cargaHoraria[nextYear] = { oferta: "-", frequencia: "-", percentual: "-", manualPercentual: true };
+                    Object.values(notas).forEach((row) => { row[nextYear] = "-"; });
+                  });
+                }
+                return { ...item, resultados, cargaHoraria, notas, estudos };
+              });
+            }}>
               <option value="">Em branco</option>
               <option>APROVADO</option>
               <option>REPROVADO</option>
@@ -3388,6 +3804,7 @@ function NotesForm({ record, updateActive }: { record: HistoryRecord; updateActi
               <option>TRANSFERIDO</option>
               <option>PROGRESSAO</option>
               <option>NAO INFORMADO</option>
+              <option value="-">-</option>
             </select>
           </label>
         ))}
@@ -3397,6 +3814,7 @@ function NotesForm({ record, updateActive }: { record: HistoryRecord; updateActi
 }
 
 function WorkloadForm({ record, updateActive }: { record: HistoryRecord; updateActive: (updater: (record: HistoryRecord) => HistoryRecord) => void }) {
+  const finalYear = lastAttendedYear(record);
   const setSchoolYear = (year: number, value: string) => {
     updateActive((item) => ({
       ...item,
@@ -3424,7 +3842,7 @@ function WorkloadForm({ record, updateActive }: { record: HistoryRecord; updateA
               <td>Ano letivo</td>
               {years.map((year) => (
                 <td key={`ano-letivo-${year}`}>
-                  <input value={record.estudos[year - 1]?.ano ?? ""} onChange={(event) => setSchoolYear(year, uppercaseInput(event.target.value))} />
+                  <input disabled={year > finalYear} value={year > finalYear ? "-" : record.estudos[year - 1]?.ano ?? ""} onChange={(event) => setSchoolYear(year, uppercaseInput(event.target.value))} />
                 </td>
               ))}
             </tr>
@@ -3432,7 +3850,7 @@ function WorkloadForm({ record, updateActive }: { record: HistoryRecord; updateA
               <tr key={field}>
                 <td>{field === "oferta" ? "Oferta anual" : field === "frequencia" ? "Frequencia anual" : "% Frequencia"}</td>
                 {years.map((year) => (
-                  <td key={year}><input value={record.cargaHoraria[year]?.[field] ?? ""} onChange={(event) => setValue(year, field, uppercaseInput(event.target.value))} /></td>
+                  <td key={year}><input disabled={year > finalYear} value={year > finalYear ? "-" : record.cargaHoraria[year]?.[field] ?? ""} onChange={(event) => setValue(year, field, uppercaseInput(event.target.value))} /></td>
                 ))}
               </tr>
             ))}
@@ -3452,7 +3870,11 @@ function StudiesForm({ record, updateActive }: { record: HistoryRecord; updateAc
       const source = item.estudos[index];
       return {
         ...item,
-        estudos: item.estudos.map((row, rowIndex) => rowIndex > index ? { ...row, escola: source.escola, cidade: source.cidade, estado: source.estado } : row),
+        estudos: item.estudos.map((row, rowIndex) => {
+          if (rowIndex <= index) return row;
+          const alreadyFilled = [row.escola, row.cidade, row.estado].some((value) => value.trim() && value !== "-");
+          return alreadyFilled ? row : { ...row, escola: source.escola, cidade: source.cidade, estado: source.estado };
+        }),
       };
     });
   };
@@ -3467,10 +3889,10 @@ function StudiesForm({ record, updateActive }: { record: HistoryRecord; updateAc
               <span>Tem</span>
             </label>
             <strong>{study.serie}</strong>
-            <input disabled={!study.ativo} value={study.ativo ? study.ano : "-"} onChange={(event) => updateStudy(index, { ano: uppercaseInput(event.target.value) })} placeholder="Ano" />
-            <input disabled={!study.ativo} value={study.ativo ? study.escola : "-"} onChange={(event) => updateStudy(index, { escola: uppercaseInput(event.target.value) })} placeholder="Estabelecimento" />
-            <input disabled={!study.ativo} value={study.ativo ? study.cidade : "-"} onChange={(event) => updateStudy(index, { cidade: uppercaseInput(event.target.value) })} placeholder="Cidade" />
-            <input disabled={!study.ativo} value={study.ativo ? study.estado : "-"} onChange={(event) => updateStudy(index, { estado: uppercaseInput(event.target.value) })} placeholder="UF" />
+            <input title={study.ano} disabled={!study.ativo} value={study.ativo ? study.ano : "-"} onChange={(event) => updateStudy(index, { ano: uppercaseInput(event.target.value) })} placeholder="Ano" />
+            <input title={study.escola} disabled={!study.ativo} value={study.ativo ? study.escola : "-"} onChange={(event) => updateStudy(index, { escola: uppercaseInput(event.target.value) })} placeholder="Estabelecimento" />
+            <input title={study.cidade} disabled={!study.ativo} value={study.ativo ? study.cidade : "-"} onChange={(event) => updateStudy(index, { cidade: uppercaseInput(event.target.value) })} placeholder="Cidade" />
+            <input title={study.estado} disabled={!study.ativo} value={study.ativo ? study.estado : "-"} onChange={(event) => updateStudy(index, { estado: uppercaseInput(event.target.value) })} placeholder="UF" />
             <button disabled={!study.ativo} onClick={() => applyNext(index)}>Usar nos proximos</button>
           </div>
         ))}
@@ -3590,14 +4012,12 @@ function CertificateForm({
 
 function Conference({
   record,
-  updateActive,
   setStep,
-  savePdfForRecord,
+  finishHistory,
 }: {
   record: HistoryRecord;
-  updateActive: (updater: (record: HistoryRecord) => HistoryRecord) => void;
   setStep: (step: number) => void;
-  savePdfForRecord: (id: string) => void;
+  finishHistory: (id: string, generatePdf?: boolean) => Promise<void>;
 }) {
   const issues = useMemo(() => {
     const list: Array<{ label: string; step: number }> = [];
@@ -3636,10 +4056,7 @@ function Conference({
           ))
         )}
       </div>
-      <div className="inline-actions">
-        <button onClick={() => updateActive((item) => ({ ...item, status: "Conferido" }))}>Marcar como conferido</button>
-        <button className="primary" onClick={() => savePdfForRecord(record.id)}>Finalizar e salvar PDF</button>
-      </div>
+      <div className="inline-actions"><button className="primary" onClick={() => void finishHistory(record.id)}>Salvar histórico</button></div>
     </>
   );
 }
@@ -3756,12 +4173,12 @@ function DocumentPageOne({ record, school }: { record: HistoryRecord; school: Sc
       <Watermark />
       <DocumentHeader school={school} useSchoolStamp={record.usarCarimboEscola} />
 
-      <h1>HISTÓRICO ESCOLAR</h1>
+      <div className="document-title-box"><h1>HISTÓRICO ESCOLAR</h1></div>
 
       <section className="student-block">
         <div className="student-name-box">
           <div className="center-label">ALUNO</div>
-          <div className="filled-line big">{upper(record.aluno.nome)}</div>
+          <div className="filled-line big student-full-name">{upper(record.aluno.nome)}</div>
         </div>
         <div className="doc-grid four labels">
           <span>DATA DE NASCIMENTO</span>

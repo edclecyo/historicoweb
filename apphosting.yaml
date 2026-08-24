@@ -1,0 +1,34 @@
+runConfig:
+  minInstances: 0
+  maxInstances: 10
+  memoryMiB: 512
+
+scripts:
+  buildCommand: npm run build
+  runCommand: npm run start
+
+env:
+  - variable: VITE_FIREBASE_API_KEY
+    value: AIzaSyABrU_aJKb2WIMAhMbvN4sZPBUgQoPefTs
+    availability:
+      - BUILD
+  - variable: VITE_FIREBASE_AUTH_DOMAIN
+    value: historicoweb-c8026.firebaseapp.com
+    availability:
+      - BUILD
+  - variable: VITE_FIREBASE_PROJECT_ID
+    value: historicoweb-c8026
+    availability:
+      - BUILD
+  - variable: VITE_FIREBASE_STORAGE_BUCKET
+    value: historicoweb-c8026.firebasestorage.app
+    availability:
+      - BUILD
+  - variable: VITE_FIREBASE_MESSAGING_SENDER_ID
+    value: "981547679883"
+    availability:
+      - BUILD
+  - variable: VITE_FIREBASE_APP_ID
+    value: "1:981547679883:web:315683fd77fe9faf11148e"
+    availability:
+      - BUILD
