@@ -1,7 +1,21 @@
 "use client";
 
-import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { firebaseEnabled, loadCloudHistories, loadCloudState, saveCloudHistory, saveCloudState } from "./firebase";
+import { Fragment, useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
+import {
+  createCloudOwner,
+  deleteCloudHistory,
+  firebaseEnabled,
+  loadCloudHistories,
+  loadCloudSetupStatus,
+  loadCloudState,
+  loginCloudAdmin,
+  loginCloudSchool,
+  logoutCloudSession,
+  saveCloudHistories,
+  saveCloudHistory,
+  saveCloudState,
+  setCloudSessionToken,
+} from "./firebase";
 
 type Area =
   | "Linguagens e Codigos"
@@ -29,6 +43,7 @@ type School = {
   reconhecimento: string;
   parecer: string;
   validade: string;
+  logoSistema: string;
   logo: string;
   carimboEscola: string;
   diretor: string;
@@ -41,14 +56,43 @@ type School = {
 
 type SchoolKind = "municipal" | "estadual";
 
+type IbgeState = {
+  id: number;
+  sigla: string;
+  nome: string;
+};
+
+type IbgeCity = {
+  id: number;
+  nome: string;
+};
+
+type SchoolDirectoryItem = {
+  nome: string;
+  municipio: string;
+  estado: string;
+  codigo?: string;
+  rede?: string;
+};
+
+type SchoolAccess = {
+  id: string;
+  usuario: string;
+  senha: string;
+  mustChangePassword: boolean;
+  createdAt: string;
+};
+
 type SchoolAccount = {
   id: string;
   usuario: string;
   senha: string;
   tipo: SchoolKind;
+  ativo: boolean;
   escola: School;
   createdAt: string;
   mustChangePassword: boolean;
+  accessos: SchoolAccess[];
 };
 
 type Student = {
@@ -156,19 +200,40 @@ type AppData = {
   folders: Folder[];
   historicos: HistoryRecord[];
   transferencias: TransferRequest[];
+  admin?: AdminCredentials | null;
+  adminUsers?: AdminUser[];
 };
 
-type AuthRole = "owner" | "school";
+type AuthRole = "owner" | "manager" | "school";
 
 type AuthSession = {
   role: AuthRole;
   nome: string;
+  adminUserId?: string;
   schoolId?: string;
+  accessId?: string;
+  sessionToken?: string;
 };
 
 type AdminCredentials = {
   usuario: string;
   senha: string;
+};
+
+type SchoolLoginCredentials = AdminCredentials & {
+  tipo: SchoolKind;
+};
+
+type AdminUser = {
+  id: string;
+  nome: string;
+  usuario: string;
+  senha: string;
+  crede: string;
+  nivel: "gestao";
+  ativo: boolean;
+  mustChangePassword: boolean;
+  createdAt: string;
 };
 
 type PhotoHistoryPayload = {
@@ -254,6 +319,7 @@ const defaultSchool: School = {
   reconhecimento: "Reconhecimento vigente",
   parecer: "0077/2024",
   validade: "31/12/2028",
+  logoSistema: "",
   logo: "/model-assets/image1.jpeg",
   carimboEscola: "",
   diretor: "",
@@ -266,7 +332,7 @@ const defaultSchool: School = {
 
 const emptySchool: School = {
   estado: "", municipio: "", nome: "", mantenedora: "", codigo: "", credenciamento: "",
-  autorizacao: "", reconhecimento: "", parecer: "", validade: "", logo: "", carimboEscola: "",
+  autorizacao: "", reconhecimento: "", parecer: "", validade: "", logoSistema: "", logo: "", carimboEscola: "",
   diretor: "", registroDiretor: "", assinaturaDiretor: "", secretario: "", registroSecretario: "",
   assinaturaSecretario: "",
 };
@@ -323,6 +389,15 @@ function studentDefaultsForSchool(school: School) {
   };
 }
 
+function isSchoolProfileReady(school: School) {
+  return Boolean(
+    school.nome.trim() &&
+    school.codigo.trim() &&
+    school.municipio.trim() &&
+    school.estado.trim(),
+  );
+}
+
 function formatDate(value: string) {
   if (!value) return "";
   const [year, month, day] = value.includes("-") ? value.split("-") : value.split("/").reverse();
@@ -356,6 +431,38 @@ function uppercaseInput(value: string) {
   return value.toLocaleUpperCase("pt-BR");
 }
 
+const allowedNoteWords = ["CURSANDO", "TRANSFERIDO", "APROVADO", "REPROVADO", "PROGRESSAO", "NAO INFORMADO"];
+
+function normalizeNoteInput(value: string) {
+  return uppercaseInput(value)
+    .replace(/\./g, ",")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isAllowedNoteTyping(value: string) {
+  const text = normalizeNoteInput(value);
+  if (!text || text === "-") return true;
+  if (/^[A-ZÀ-Ú\s-]+$/.test(text)) return allowedNoteWords.some((word) => word.startsWith(plain(text)));
+  return /^(?:10(?:,0?)?|[0-9](?:,[0-9]?)?)$/.test(text);
+}
+
+function isValidNoteValue(value: string) {
+  const text = normalizeNoteInput(value);
+  if (!text || text === "-") return true;
+  if (allowedNoteWords.includes(plain(text))) return true;
+  return /^(?:10(?:,0)?|[0-9](?:,[0-9])?)$/.test(text);
+}
+
+function formatNoteValue(value: string) {
+  const text = normalizeNoteInput(value);
+  if (!text || text === "-") return text;
+  if (allowedNoteWords.includes(plain(text))) return text;
+  if (!isValidNoteValue(text)) return "";
+  const [integer, decimal = "0"] = text.split(",");
+  return `${integer},${decimal || "0"}`;
+}
+
 function safeFileName(value: string) {
   return (upper(value).trim() || "HISTORICOS")
     .normalize("NFD")
@@ -363,6 +470,379 @@ function safeFileName(value: string) {
     .replace(/[^A-Z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .toLocaleLowerCase("pt-BR");
+}
+
+function safePdfTitle(value: string) {
+  return (upper(value).trim() || "HISTORICO")
+    .replace(/[<>:"/\\|?*\u0000-\u001f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function printWithTitle(title: string) {
+  const previousTitle = document.title;
+  document.title = safePdfTitle(title);
+  window.print();
+  window.setTimeout(() => {
+    document.title = previousTitle;
+  }, 600);
+}
+
+const ibgeBaseUrl = "https://servicodados.ibge.gov.br/api/v1/localidades";
+const inepSchoolDirectoryUrl = "https://services3.arcgis.com/ba17q0p2zHwzRK3B/ArcGIS/rest/services/inep_escolas_fmt_250609_geocode/FeatureServer/1/query";
+const brazilStateFallback: IbgeState[] = [
+  { id: 12, sigla: "AC", nome: "Acre" },
+  { id: 27, sigla: "AL", nome: "Alagoas" },
+  { id: 16, sigla: "AP", nome: "Amapa" },
+  { id: 13, sigla: "AM", nome: "Amazonas" },
+  { id: 29, sigla: "BA", nome: "Bahia" },
+  { id: 23, sigla: "CE", nome: "Ceara" },
+  { id: 53, sigla: "DF", nome: "Distrito Federal" },
+  { id: 32, sigla: "ES", nome: "Espirito Santo" },
+  { id: 52, sigla: "GO", nome: "Goias" },
+  { id: 21, sigla: "MA", nome: "Maranhao" },
+  { id: 51, sigla: "MT", nome: "Mato Grosso" },
+  { id: 50, sigla: "MS", nome: "Mato Grosso do Sul" },
+  { id: 31, sigla: "MG", nome: "Minas Gerais" },
+  { id: 15, sigla: "PA", nome: "Para" },
+  { id: 25, sigla: "PB", nome: "Paraiba" },
+  { id: 41, sigla: "PR", nome: "Parana" },
+  { id: 26, sigla: "PE", nome: "Pernambuco" },
+  { id: 22, sigla: "PI", nome: "Piaui" },
+  { id: 33, sigla: "RJ", nome: "Rio de Janeiro" },
+  { id: 24, sigla: "RN", nome: "Rio Grande do Norte" },
+  { id: 43, sigla: "RS", nome: "Rio Grande do Sul" },
+  { id: 11, sigla: "RO", nome: "Rondonia" },
+  { id: 14, sigla: "RR", nome: "Roraima" },
+  { id: 42, sigla: "SC", nome: "Santa Catarina" },
+  { id: 35, sigla: "SP", nome: "Sao Paulo" },
+  { id: 28, sigla: "SE", nome: "Sergipe" },
+  { id: 17, sigla: "TO", nome: "Tocantins" },
+];
+let cachedStates: IbgeState[] | null = null;
+const cachedCities = new Map<string, IbgeCity[]>();
+const cachedSchoolDirectory = new Map<string, SchoolDirectoryItem[]>();
+const seedSchoolDirectory: SchoolDirectoryItem[] = [
+  "Afonso Tavares de Luna",
+  "Ana Furtado da Gloria Escola Municipal",
+  "Antonia Lucena de Melo Escola",
+  "Antonio Gomes de Santana",
+  "Antonio Marcelino de Sousa",
+  "Antonio Miguel de Sousa Escola Municipal",
+  "Antonio Ne",
+  "Apolonia Escola Municipal Sta",
+  "Assoc Benef e Assist Pe Pedro Inacio Ribeiro",
+  "Balduino Nunes Barreto Escola Municipal",
+  "Bartolomeu Madeiro",
+  "Bertini Moreira Leite Salviano Escola de Ensino Fundamental",
+  "Cassiano Inacio Bezerra",
+  "Catequista Maria Alacoque",
+  "Centro de Educacao Infantil Professora Maria Ieda Macedo",
+  "Centro de Estudos Profissionalizantes - Cep",
+  "Centro Educacional Jean Piaget",
+  "Centro Educacional Lua de Cristal",
+  "Centro Educacional Maranata",
+  "Centro Educacional Monteiro Lobato",
+  "Centro Educacional Professora Sabina Gomes de Sousa",
+  "Centro Educacional Quero Aprender",
+  "Centro Educacional Sonho Meu",
+  "Centro Tecnico Integrado de Saude",
+  "Cicera Martins de Lucena Escola Isol Profa",
+  "Cicero Escola Municipal de Pe",
+  "Clotildes Moreira Tavares",
+  "Colegio Padre Viana",
+  "Dr Valdemar Napoleao de Araujo",
+  "Educandario Aurelio Buarque",
+  "Eeep Balbina Viana Arrais",
+  "Eefm Jose Matias Sampaio",
+  "Elias Felinto de Lucena",
+  "Emilia Ferreiro Centro Educacional",
+  "Enoque Belem de Figueiredo Escola Municipal",
+  "Enoque Penha Centro de Educacao Infantil",
+  "Escola de Ensino Especial",
+  "Familia Sagrada",
+  "Fca Furtado de Lima Escola Isol",
+  "Fonte do Saber-centro de Educacao Infantil",
+  "Fonte do Sol Nascente Escola de Ensino Infantil",
+  "Francisca Alves Tavares",
+  "Francisco de Assis Lucena Escola de Ensino Fundamental",
+  "Francisco Leite de Moura",
+  "Francisco Ricaom Basilio Lucena",
+  "Historiador Padre Antonio Gomes de Araujo",
+  "Instituto Educacional Casinha da Crianca Joao Paulo Ii",
+  "Instituto Educacional Joao Xxiii",
+  "Irma Lucia Centro de Educacao Infantil",
+  "Joao Cardoso Ltda Educandario",
+  "Joao Frutuoso Cavalcante Escola Municipal",
+  "Joao Goncalves de Sousa",
+  "Joao Landim da Cruz",
+  "Joao Matias de Sousa Escola de Ensino Fundamental",
+  "Joao Tavares de Luna",
+  "Joao Tavares Moreira Escola Mef",
+  "Joaquim de Oliveira Santos Escola Municipal",
+  "Joaquim Furtado de Lucena",
+  "Joaquim Gomes Basilio",
+  "Joaquim Tavares de Luna",
+  "Jonas Alves da Costa",
+  "Jose Amaro Pinheiro Centro de Ed Infantil",
+  "Jose Cardoso Ferreira",
+  "Jose Denguinho de Santana Cent Educacional Infantil",
+  "Jose Francisco Nogueira",
+  "Jose Inacio de Lucena Escola de Ensino Fundamental",
+  "Jose Lino Ferreira Escola de Ensino Fundamental",
+  "Jose Marcos Escola Municipal",
+  "Jose Moreira Tavares",
+  "Jose Pereira de Lima Escola de Ensino Fundamental",
+  "Josefa Edileuma B Pereira Escola Isolada",
+  "Juca Lino",
+  "Juvino Ferreira",
+  "Lauro Martins Cardoso Escola Municipal",
+  "Liceu Professor Jose Teles de Carvalho",
+  "Lions Clube de Brejo Santo",
+  "Lucia Alves da Silva Escola Isolada",
+  "Luzia Leite Basilio Escola de Ensino Fundamental",
+  "Major Firmino Inacio de Sousa",
+  "Manoel do Nascimento- Centro de Educacao Infantil",
+  "Manoel Inacio de Lucena Coronel",
+  "Manoel Reginaldo Bezerra Escola de Ensino Fundamental",
+  "Maria Benvinda Quental Lucena",
+  "Maria Heraclides Lucena Miranda Professora Escola de Ensino Basico",
+  "Maria Jose Clube das Maes",
+  "Maria Leite de Araujo",
+  "Maria Martins de Sousa",
+  "Maria Salome Monteiro Centro de Ed Inf Professora",
+  "Maria Sonete Andrade Escola de Ensino Fundamental",
+  "Mestre Ze Luis Silva Ramos",
+  "Morro Dourado",
+  "Nezinho Saturnino",
+  "Nobilino Alves de Araujo",
+  "Nossa Senhora do Santissimo Sacramento",
+  "Odilia Estelita da Costa",
+  "Olimpio Pereira de Lima Escola de Ensino Fundamental",
+  "Padre Pedro Inacio Ribeiro",
+  "Paraiso da Crianca Centro de Educacao Infantil",
+  "Paulo Freire Escola de 1 Grau",
+  "Pedro Geronimo da Silva Escola Municipal",
+  "Pedro Martins Cardoso de Morais Escola Municipal",
+  "Pedro Vicente de Sousa Escola Municipal",
+  "Pequeno Principe - Centro Educacional Infantil",
+  "Pergentino Martins de Morais Escola de Ens Fundamental",
+  "Pierre Vigne Centro Educacional",
+  "Primeiros Passos Instituto Educacional",
+  "Professor Joao Teles de Carvalho",
+  "Professor Pedro Gomes da Silva Basilio",
+  "Professora Maria Leoneide Leandro Lima Creche Proinfancia",
+  "Professora Rosa Roberto",
+  "Professora Sabina Gomes de Sousa",
+  "Raimundo Goncalves Centro de Ed Inf Vereador",
+  "Raimundo Moreira Luna Escola de Ensino Fundamental",
+  "Refugio Alegria Centro de Educacao Infantil",
+  "Regina Leite dos Santos Escola Isol",
+  "Romao dos Anjos Monteiro Vasconcelos",
+  "Sonho Infantil- Centro de Educacao Infantil",
+  "Teresinha Martins Cardoso Centro de Ed Inf",
+  "Vida Centro de Educacao Infantil",
+  "Vovo do Carme",
+  "Vovo Joaquina Centro de Educacao Infantil",
+  "Washington Gomes Furtado Escola Municipal",
+].map((nome) => ({
+  nome: uppercaseInput(nome),
+  municipio: "BREJO SANTO",
+  estado: "CE",
+}));
+
+function findStateCode(states: IbgeState[], value: string) {
+  const normalized = compactPlain(value);
+  return states.find((state) => compactPlain(state.sigla) === normalized || compactPlain(state.nome) === normalized)?.sigla ?? value;
+}
+
+function useBrazilLocations(selectedState: string) {
+  const [states, setStates] = useState<IbgeState[]>(cachedStates ?? brazilStateFallback);
+  const [cities, setCities] = useState<IbgeCity[]>([]);
+  const [loadingCities, setLoadingCities] = useState(false);
+
+  useEffect(() => {
+    if (cachedStates) return;
+    let cancelled = false;
+    fetch(`${ibgeBaseUrl}/estados?orderBy=nome`)
+      .then((response) => response.ok ? response.json() as Promise<IbgeState[]> : [])
+      .then((items) => {
+        if (cancelled) return;
+        const nextItems = items.length ? items : brazilStateFallback;
+        cachedStates = nextItems;
+        setStates(nextItems);
+      })
+      .catch((error) => console.error("Nao foi possivel carregar os estados.", error));
+    return () => { cancelled = true; };
+  }, []);
+
+  const stateCode = useMemo(() => findStateCode(states, selectedState), [states, selectedState]);
+
+  useEffect(() => {
+    const code = stateCode.trim().toLocaleUpperCase("pt-BR");
+    if (!code || code.length !== 2) {
+      setCities([]);
+      return;
+    }
+    const saved = cachedCities.get(code);
+    if (saved) {
+      setCities(saved);
+      setLoadingCities(false);
+      return;
+    }
+    let cancelled = false;
+    setLoadingCities(true);
+    fetch(`${ibgeBaseUrl}/estados/${code}/municipios?orderBy=nome`)
+      .then((response) => response.ok ? response.json() as Promise<IbgeCity[]> : [])
+      .then((items) => {
+        if (cancelled) return;
+        cachedCities.set(code, items);
+        setCities(items);
+        setLoadingCities(false);
+      })
+      .catch((error) => {
+        if (!cancelled) setLoadingCities(false);
+        console.error("Nao foi possivel carregar os municipios.", error);
+      });
+    return () => { cancelled = true; };
+  }, [stateCode]);
+
+  return { states, cities, stateCode, loadingCities };
+}
+
+function schoolDirectoryKey(municipio: string, estado: string) {
+  return `${compactPlain(estado)}|${compactPlain(municipio)}`;
+}
+
+function cleanSqlText(value: string) {
+  return plain(value).replace(/'/g, "''");
+}
+
+function readDirectoryText(attributes: Record<string, unknown>, names: string[]) {
+  for (const name of names) {
+    const value = attributes[name];
+    if (typeof value === "string" || typeof value === "number") return uppercaseInput(String(value));
+  }
+  return "";
+}
+
+function parseSchoolDirectoryFeatures(payload: unknown): SchoolDirectoryItem[] {
+  const features = typeof payload === "object" && payload && "features" in payload
+    ? (payload as { features?: unknown }).features
+    : [];
+  if (!Array.isArray(features)) return [];
+  return features
+    .map((feature) => {
+      const attributes = typeof feature === "object" && feature && "attributes" in feature
+        ? (feature as { attributes?: unknown }).attributes
+        : null;
+      if (!attributes || typeof attributes !== "object") return null;
+      const attrs = attributes as Record<string, unknown>;
+      const nome = readDirectoryText(attrs, ["Escola", "escola", "NO_ENTIDADE", "nome"]);
+      if (!nome) return null;
+      return {
+        nome,
+        codigo: readDirectoryText(attrs, ["Código_INEP", "Codigo_INEP", "CO_ENTIDADE", "codigo"]),
+        estado: readDirectoryText(attrs, ["UF", "SG_UF", "estado"]),
+        municipio: readDirectoryText(attrs, ["Município", "Municipio", "NO_MUNICIPIO", "municipio"]),
+        rede: readDirectoryText(attrs, ["Dependência_Administrativa", "Dependencia_Administrativa", "TP_DEPENDENCIA", "rede"]),
+      };
+    })
+    .filter((item): item is SchoolDirectoryItem => Boolean(item));
+}
+
+function uniqueSchoolDirectory(items: SchoolDirectoryItem[]) {
+  const byKey = new Map<string, SchoolDirectoryItem>();
+  for (const item of items) {
+    const key = `${compactPlain(item.estado)}|${compactPlain(item.municipio)}|${compactPlain(item.nome)}`;
+    if (!byKey.has(key)) byKey.set(key, item);
+  }
+  return Array.from(byKey.values()).sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR"));
+}
+
+function localSchoolDirectory(schools: SchoolAccount[], histories: HistoryRecord[]) {
+  const items: SchoolDirectoryItem[] = [...seedSchoolDirectory];
+  for (const account of schools) {
+    if (!account.escola.nome.trim()) continue;
+    items.push({
+      nome: uppercaseInput(account.escola.nome),
+      municipio: uppercaseInput(account.escola.municipio),
+      estado: uppercaseInput(account.escola.estado),
+      codigo: account.escola.codigo,
+      rede: account.tipo === "estadual" ? "ESTADUAL" : "MUNICIPAL",
+    });
+  }
+  for (const record of histories) {
+    for (const study of record.estudos) {
+      if (!study.escola.trim() || study.escola.trim() === "-") continue;
+      items.push({
+        nome: uppercaseInput(study.escola),
+        municipio: uppercaseInput(study.cidade),
+        estado: uppercaseInput(study.estado),
+      });
+    }
+  }
+  return uniqueSchoolDirectory(items);
+}
+
+function filterLocalSchoolDirectory(items: SchoolDirectoryItem[], municipio: string, estado: string) {
+  const cityKey = compactPlain(municipio);
+  const stateKey = compactPlain(estado);
+  if (!cityKey && !stateKey) return items;
+  return items.filter((item) => {
+    const itemCity = compactPlain(item.municipio);
+    const itemState = compactPlain(item.estado);
+    return (!cityKey || itemCity === cityKey) && (!stateKey || itemState === stateKey);
+  });
+}
+
+function useSchoolDirectory(municipio: string, estado: string, fallback: SchoolDirectoryItem[]) {
+  const [officialSchools, setOfficialSchools] = useState<SchoolDirectoryItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const state = upper(estado).slice(0, 2);
+  const city = uppercaseInput(municipio);
+  const localSchools = useMemo(() => filterLocalSchoolDirectory(fallback, city, state), [fallback, city, state]);
+
+  useEffect(() => {
+    if (!city || state.length !== 2) {
+      setOfficialSchools([]);
+      setLoading(false);
+      return;
+    }
+    const key = schoolDirectoryKey(city, state);
+    const saved = cachedSchoolDirectory.get(key);
+    if (saved) {
+      setOfficialSchools(saved);
+      setLoading(false);
+      return;
+    }
+    const params = new URLSearchParams({
+      where: `UPPER(UF)='${cleanSqlText(state)}' AND UPPER(Município)='${cleanSqlText(city)}'`,
+      outFields: "Escola,Código_INEP,UF,Município,Dependência_Administrativa",
+      returnGeometry: "false",
+      orderByFields: "Escola ASC",
+      resultRecordCount: "2000",
+      f: "json",
+    });
+    let cancelled = false;
+    setLoading(true);
+    fetch(`${inepSchoolDirectoryUrl}?${params.toString()}`)
+      .then((response) => response.ok ? response.json() : null)
+      .then((payload) => {
+        if (cancelled) return;
+        const items = uniqueSchoolDirectory(parseSchoolDirectoryFeatures(payload));
+        cachedSchoolDirectory.set(key, items);
+        setOfficialSchools(items);
+        setLoading(false);
+      })
+      .catch((error) => {
+        if (!cancelled) setLoading(false);
+        console.error("Nao foi possivel carregar escolas.", error);
+      });
+    return () => { cancelled = true; };
+  }, [city, state]);
+
+  return { schools: uniqueSchoolDirectory([...officialSchools, ...localSchools]), loading };
 }
 
 function crc32(bytes: Uint8Array) {
@@ -782,11 +1262,11 @@ function createHistory(school: School, schoolId = "", folder?: Folder | null): H
     updatedAt: new Date().toISOString(),
     aluno: studentDefaultsForSchool(school),
     dadosLegais: {
-      credenciamento: school.credenciamento,
-      autorizacao: school.autorizacao,
-      reconhecimento: school.reconhecimento,
-      parecer: school.parecer,
-      validade: school.validade,
+      credenciamento: school.credenciamento || defaultSchool.credenciamento,
+      autorizacao: school.autorizacao || defaultSchool.autorizacao,
+      reconhecimento: school.reconhecimento || defaultSchool.reconhecimento,
+      parecer: school.parecer || defaultSchool.parecer,
+      validade: school.validade || defaultSchool.validade,
     },
     matriz: matrixSeed,
     notas: createBlankNotes(),
@@ -1409,20 +1889,106 @@ const authStorageKey = "historico-escolar-online:auth:v1";
 const adminStorageKey = "historico-escolar-online:admin:v1";
 const migratedSchoolId = "escola-principal";
 
+const credeOptions = [
+  "CREDE 1 - MARACANAU",
+  "CREDE 2 - ITAPIPOCA",
+  "CREDE 3 - ACARAU",
+  "CREDE 4 - CAMOCIM",
+  "CREDE 5 - TIANGUA",
+  "CREDE 6 - SOBRAL",
+  "CREDE 7 - CANINDE",
+  "CREDE 8 - BATURITE",
+  "CREDE 9 - HORIZONTE",
+  "CREDE 10 - RUSSAS",
+  "CREDE 11 - JAGUARIBE",
+  "CREDE 12 - QUIXADA",
+  "CREDE 13 - CRATEUS",
+  "CREDE 14 - SENADOR POMPEU",
+  "CREDE 15 - TAUA",
+  "CREDE 16 - IGUATU",
+  "CREDE 17 - ICO",
+  "CREDE 18 - CRATO",
+  "CREDE 19 - JUAZEIRO DO NORTE",
+  "CREDE 20 - BREJO SANTO",
+];
+
+function createAdminUser(input?: Partial<AdminUser>): AdminUser {
+  return {
+    id: input?.id || crypto.randomUUID(),
+    nome: uppercaseInput(input?.nome?.trim() || ""),
+    usuario: uppercaseInput(input?.usuario?.trim() || ""),
+    senha: input?.senha?.trim() || "123456",
+    crede: uppercaseInput(input?.crede?.trim() || "CREDE 20 - BREJO SANTO"),
+    nivel: "gestao",
+    ativo: input?.ativo ?? true,
+    mustChangePassword: input?.mustChangePassword ?? !input?.id,
+    createdAt: input?.createdAt || new Date().toISOString(),
+  };
+}
+
+function createSchoolAccess(input?: Partial<SchoolAccess>): SchoolAccess {
+  return {
+    id: input?.id || crypto.randomUUID(),
+    usuario: uppercaseInput(input?.usuario?.trim() || ""),
+    senha: input?.senha?.trim() || "123456",
+    mustChangePassword: input?.mustChangePassword ?? !input?.id,
+    createdAt: input?.createdAt || new Date().toISOString(),
+  };
+}
+
 function createSchoolAccount(input?: Partial<SchoolAccount> & { escola?: Partial<School> }): SchoolAccount {
   const escola = { ...(input?.id ? defaultSchool : emptySchool), ...(input?.escola ?? {}) };
   const usuario = input && "usuario" in input
     ? input.usuario ?? ""
     : safeFileName(escola.nome || "ESCOLA").replace(/-/g, "");
+  const mainAccess = createSchoolAccess({
+    id: input?.accessos?.[0]?.id || `${input?.id || "nova-escola"}-principal`,
+    usuario,
+    senha: input?.senha || "123456",
+    mustChangePassword: input?.mustChangePassword ?? !input?.id,
+    createdAt: input?.createdAt,
+  });
+  const accessos = input?.accessos?.length
+    ? input.accessos.map((access, index) => createSchoolAccess({
+        ...access,
+        usuario: access.usuario || (index === 0 ? usuario : ""),
+        senha: access.senha || (index === 0 ? input?.senha : "123456"),
+      }))
+    : [mainAccess];
+  const primaryAccess = accessos[0] ?? mainAccess;
   return {
     id: input?.id || crypto.randomUUID(),
-    usuario: uppercaseInput(usuario),
-    senha: input?.senha || "123456",
+    usuario: primaryAccess.usuario,
+    senha: primaryAccess.senha,
     tipo: input?.tipo || "municipal",
+    ativo: input?.ativo ?? true,
     escola,
     createdAt: input?.createdAt || new Date().toISOString(),
-    mustChangePassword: input?.mustChangePassword ?? !input?.id,
+    mustChangePassword: primaryAccess.mustChangePassword,
+    accessos,
   };
+}
+
+function hasDuplicatedSchoolAccess(accounts: SchoolAccount[]) {
+  const seen = new Set<string>();
+  return accounts.some((account) => account.accessos.some((access) => {
+    if (!access.usuario) return false;
+    const key = `${account.tipo}:${access.usuario}`;
+    if (seen.has(key)) return true;
+    seen.add(key);
+    return false;
+  }));
+}
+
+function hasDuplicatedAdminAccess(admin: AdminCredentials | null | undefined, users: AdminUser[]) {
+  const seen = new Set<string>();
+  if (admin?.usuario) seen.add(admin.usuario);
+  return users.some((user) => {
+    if (!user.usuario) return false;
+    if (seen.has(user.usuario)) return true;
+    seen.add(user.usuario);
+    return false;
+  });
 }
 
 function normalizeFolder(folder: Partial<Folder>, schoolId: string): Folder {
@@ -1527,7 +2093,7 @@ function normalizeHistory(record: HistoryRecord, fallbackSchoolId = migratedScho
 
 function loadInitialData(): AppData {
   if (typeof window === "undefined") {
-    return { escola: defaultSchool, escolas: [], folders: [], historicos: [], transferencias: [] };
+    return { escola: defaultSchool, escolas: [], folders: [], historicos: [], transferencias: [], admin: null, adminUsers: [] };
   }
   const saved = window.localStorage.getItem(storageKey);
   if (saved) {
@@ -1537,7 +2103,12 @@ function loadInitialData(): AppData {
         const migratedSchool = createSchoolAccount({
           id: migratedSchoolId,
           usuario: "ESCOLA",
-          escola: { ...defaultSchool, ...parsed.escola, logo: parsed.escola?.logo || defaultSchool.logo },
+          escola: {
+            ...defaultSchool,
+            ...parsed.escola,
+            logoSistema: parsed.escola?.logoSistema || "",
+            logo: parsed.escola?.logo || defaultSchool.logo,
+          },
         });
         const escolas = parsed.escolas?.length
           ? parsed.escolas.map((account) => createSchoolAccount(account))
@@ -1550,13 +2121,15 @@ function loadInitialData(): AppData {
           folders,
           historicos: (parsed.historicos ?? []).map((record) => normalizeHistory(record, firstSchoolId, folders)),
           transferencias: parsed.transferencias ?? [],
+          admin: parsed.admin ?? null,
+          adminUsers: (parsed.adminUsers ?? []).map(createAdminUser),
         };
       }
     } catch {
       window.localStorage.removeItem(storageKey);
     }
   }
-  return { escola: defaultSchool, escolas: [], folders: [], historicos: [], transferencias: [] };
+  return { escola: defaultSchool, escolas: [], folders: [], historicos: [], transferencias: [], admin: null, adminUsers: [] };
 }
 
 function loadAdminCredentials() {
@@ -1578,7 +2151,7 @@ function loadAuthSession() {
   if (!saved) return null;
   try {
     const parsed = JSON.parse(saved) as AuthSession;
-    if (parsed?.role === "owner" || parsed?.role === "school") return parsed?.nome ? parsed : null;
+    if (parsed?.role === "owner" || parsed?.role === "manager" || parsed?.role === "school") return parsed?.nome ? parsed : null;
     return null;
   } catch {
     window.localStorage.removeItem(authStorageKey);
@@ -1590,15 +2163,58 @@ function storeAuthSession(session: AuthSession | null) {
   if (typeof window === "undefined") return;
   if (!session) {
     window.localStorage.removeItem(authStorageKey);
+    setCloudSessionToken(null);
     return;
   }
+  setCloudSessionToken(session.sessionToken ?? null);
   window.localStorage.setItem(authStorageKey, JSON.stringify(session));
 }
 
+function normalizeLoadedData(cloudData: AppData, cloudHistories: HistoryRecord[] = []): AppData {
+  const combinedHistories = [...(cloudData.historicos ?? []), ...cloudHistories];
+  const escolas = (cloudData.escolas ?? []).map((account) => createSchoolAccount(account));
+  const firstSchoolId = escolas[0]?.id || migratedSchoolId;
+  const folders = (cloudData.folders ?? []).map((folder) => normalizeFolder(folder, firstSchoolId));
+  return {
+    ...cloudData,
+    escola: cloudData.escola ?? escolas[0]?.escola ?? defaultSchool,
+    escolas,
+    folders,
+    transferencias: cloudData.transferencias ?? [],
+    historicos: Array.from(new Map(combinedHistories.map((record) => [record.id, normalizeHistory(record, record.schoolId || firstSchoolId, folders)])).values()),
+    admin: cloudData.admin ?? null,
+    adminUsers: (cloudData.adminUsers ?? []).map(createAdminUser),
+  };
+}
+
+function cloudReadyData(data: AppData): AppData {
+  return {
+    ...data,
+    historicos: data.historicos.map((record) => {
+      const { fotosHistorico: _photos, ...cleanRecord } = record;
+      return cleanRecord;
+    }),
+  };
+}
+
+function cloudReadyHistory(record: HistoryRecord) {
+  const { fotosHistorico: _photos, ...cleanRecord } = record;
+  return cleanRecord;
+}
+
+function saveFailureState(error: unknown) {
+  const code = typeof error === "object" && error && "code" in error
+    ? String((error as { code?: unknown }).code)
+    : "";
+  if (code === "permission-denied") return "Não foi possível salvar";
+  return "Salvo";
+}
+
 function App() {
-  const [data, setData] = useState<AppData>({ escola: defaultSchool, escolas: [], folders: [], historicos: [], transferencias: [] });
+  const [data, setData] = useState<AppData>({ escola: defaultSchool, escolas: [], folders: [], historicos: [], transferencias: [], admin: null, adminUsers: [] });
   const [auth, setAuth] = useState<AuthSession | null>(null);
   const [adminCredentials, setAdminCredentials] = useState<AdminCredentials | null>(null);
+  const [cloudHasAdmin, setCloudHasAdmin] = useState(false);
   const [activeId, setActiveId] = useState("");
   const [activeFolderId, setActiveFolderId] = useState("");
   const [folderDraft, setFolderDraft] = useState("");
@@ -1619,7 +2235,19 @@ function App() {
   const currentSchoolAccount = auth?.role === "school"
     ? data.escolas.find((school) => school.id === auth.schoolId)
     : null;
+  const currentAdminUser = auth?.role === "manager"
+    ? (data.adminUsers ?? []).find((user) => user.id === auth.adminUserId)
+    : null;
+  const currentSchoolAccesses = currentSchoolAccount?.accessos?.length
+    ? currentSchoolAccount.accessos
+    : currentSchoolAccount
+      ? [createSchoolAccess({ usuario: currentSchoolAccount.usuario, senha: currentSchoolAccount.senha, mustChangePassword: currentSchoolAccount.mustChangePassword })]
+      : [];
+  const currentSchoolAccess = currentSchoolAccesses.find((access) => access.id === auth?.accessId)
+    ?? currentSchoolAccesses.find((access) => access.usuario === auth?.nome)
+    ?? currentSchoolAccesses[0];
   const currentSchool = currentSchoolAccount?.escola ?? defaultSchool;
+  const schoolProfileReady = currentSchoolAccount ? isSchoolProfileReady(currentSchool) : false;
   const schoolFolders = currentSchoolAccount
     ? data.folders.filter((folder) => folder.schoolId === currentSchoolAccount.id)
     : [];
@@ -1637,35 +2265,41 @@ function App() {
   const receivedTransferNotices = currentSchoolAccount
     ? data.transferencias.filter((request) => request.toSchoolId === currentSchoolAccount.id && request.status === "Enviado" && !request.hiddenForSchoolIds?.includes(currentSchoolAccount.id))
     : [];
+  const schoolDirectory = useMemo(() => localSchoolDirectory(data.escolas, data.historicos), [data.escolas, data.historicos]);
 
   useEffect(() => {
     let cancelled = false;
     const initializeData = async () => {
       const localData = loadInitialData();
       let initialData = localData;
+      const session = loadAuthSession();
+      let activeSession = session;
+      setCloudSessionToken(session?.sessionToken ?? null);
       if (firebaseEnabled) {
         try {
-          const cloudData = await loadCloudState<AppData>();
-          const cloudHistories = await loadCloudHistories<HistoryRecord>();
-          if (cloudData) {
-            const combinedHistories = [...(cloudData.historicos ?? []), ...cloudHistories];
-            initialData = {
-              ...cloudData,
-              transferencias: cloudData.transferencias ?? [],
-              historicos: Array.from(new Map(combinedHistories.map((record) => [record.id, record])).values()),
-            };
+          if (session?.sessionToken) {
+            const cloudData = await loadCloudState<AppData>();
+            const cloudHistories = await loadCloudHistories<HistoryRecord>();
+            if (cloudData) {
+              initialData = normalizeLoadedData(cloudData, cloudHistories);
+            } else {
+              activeSession = null;
+              storeAuthSession(null);
+            }
+          } else {
+            const setup = await loadCloudSetupStatus();
+            setCloudHasAdmin(setup.hasAdmin);
           }
         } catch (error) {
-          console.error("Nao foi possivel carregar os dados do Firebase.", error);
+          console.error("Nao foi possivel carregar os dados.", error);
         }
       }
       if (cancelled) return;
       setData(initialData);
-      setAdminCredentials(loadAdminCredentials());
-      const session = loadAuthSession();
-      setAuth(session);
-      const firstRecord = session?.role === "school"
-        ? initialData.historicos.find((record) => record.schoolId === session.schoolId)
+      setAdminCredentials(initialData.admin ?? loadAdminCredentials());
+      setAuth(activeSession);
+      const firstRecord = activeSession?.role === "school"
+        ? initialData.historicos.find((record) => record.schoolId === activeSession.schoolId)
         : null;
       setActiveId(firstRecord?.id ?? "");
       setIsReady(true);
@@ -1680,18 +2314,38 @@ function App() {
       logout();
       return;
     }
+    if (!schoolProfileReady) {
+      if (view !== "escola") setView("escola");
+      return;
+    }
     if (!activeId && schoolRecords[0]) setActiveId(schoolRecords[0].id);
     if (!schoolFolders.length && !["escola", "turmas", "novo"].includes(view)) setView("historicos");
-  }, [auth, currentSchoolAccount, activeId, schoolRecords, schoolFolders.length, view]);
+  }, [auth, currentSchoolAccount, schoolProfileReady, activeId, schoolRecords, schoolFolders.length, view]);
 
   useEffect(() => {
     if (!isReady) return;
-    setSaveState("Rascunho neste dispositivo");
+    setSaveState("Salvando...");
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
     saveTimer.current = window.setTimeout(() => {
       window.localStorage.setItem(storageKey, JSON.stringify(data));
-      setSaveState("Rascunho neste dispositivo");
-    }, 380);
+      if (!firebaseEnabled) {
+        setSaveState("Salvo");
+        return;
+      }
+      void saveCloudState(cloudReadyData(data))
+        .then((stateSaved) => {
+          if (!stateSaved) throw new Error("Falha ao salvar dados.");
+          return saveCloudHistories(data.historicos.map(cloudReadyHistory));
+        })
+        .then((historiesSaved) => {
+          if (!historiesSaved) throw new Error("Falha ao salvar históricos.");
+          setSaveState("Salvo");
+        })
+        .catch((error) => {
+          console.error("Falha ao salvar.", error);
+          setSaveState(saveFailureState(error));
+        });
+    }, 700);
   }, [data, isReady]);
 
   useEffect(() => {
@@ -1728,44 +2382,242 @@ function App() {
     }));
   };
 
-  const createAdminAccess = (credentials: AdminCredentials) => {
+  const applyCloudLogin = (payload: AppData, session: AuthSession, histories?: HistoryRecord[]) => {
+    const nextData = normalizeLoadedData(payload, histories ?? []);
+    setData(nextData);
+    setAdminCredentials(nextData.admin ?? null);
+    setAuth(session);
+    storeAuthSession(session);
+    setCloudHasAdmin(Boolean(nextData.admin?.usuario));
+    const firstRecord = session.role === "school"
+      ? nextData.historicos.find((record) => record.schoolId === session.schoolId)
+      : null;
+    setActiveFolderId("");
+    setActiveId(firstRecord?.id ?? "");
+    setView("historicos");
+  };
+
+  const createAdminAccess = async (credentials: AdminCredentials) => {
     const clean = {
       usuario: uppercaseInput(credentials.usuario.trim()),
       senha: credentials.senha.trim(),
     };
     if (!clean.usuario || !clean.senha) {
-      window.alert("Informe usuario e senha do administrador.");
+      window.alert("Informe usuario e senha.");
       return;
+    }
+    if (firebaseEnabled) {
+      try {
+        const result = await createCloudOwner<AppData>(clean);
+        applyCloudLogin(result.payload, result.session, result.histories as HistoryRecord[] | undefined);
+        return;
+      } catch (error) {
+        console.error("Falha ao criar acesso restrito.", error);
+        window.alert("Não foi possível criar o acesso restrito agora.");
+        return;
+      }
     }
     window.localStorage.setItem(adminStorageKey, JSON.stringify(clean));
     setAdminCredentials(clean);
+    const nextData = { ...data, admin: clean };
+    setData(nextData);
+    void persistData(nextData, "Acesso restrito salvo");
     const session = { role: "owner" as const, nome: clean.usuario };
     setAuth(session);
     storeAuthSession(session);
   };
 
-  const loginAdmin = (credentials: AdminCredentials) => {
-    if (!adminCredentials) return createAdminAccess(credentials);
+  const loginAdmin = async (credentials: AdminCredentials) => {
+    if (!adminCredentials && !cloudHasAdmin) return createAdminAccess(credentials);
     const usuario = uppercaseInput(credentials.usuario.trim());
     const senha = credentials.senha.trim();
-    if (usuario !== adminCredentials.usuario || senha !== adminCredentials.senha) {
-      window.alert("Usuario ou senha do administrador incorretos.");
+    if (firebaseEnabled) {
+      try {
+        const result = await loginCloudAdmin<AppData>({ usuario, senha });
+        applyCloudLogin(result.payload, result.session, result.histories as HistoryRecord[] | undefined);
+        return;
+      } catch (error) {
+        console.error("Falha no login restrito.", error);
+        window.alert("Usuario ou senha incorretos.");
+        return;
+      }
+    }
+    if (usuario === adminCredentials.usuario && senha === adminCredentials.senha) {
+      const session = { role: "owner" as const, nome: usuario };
+      setAuth(session);
+      storeAuthSession(session);
       return;
     }
-    const session = { role: "owner" as const, nome: usuario };
+    const adminUser = (data.adminUsers ?? []).find((user) => user.ativo && user.usuario === usuario && user.senha === senha);
+    if (!adminUser) {
+      window.alert("Usuario ou senha incorretos.");
+      return;
+    }
+    const session = { role: "manager" as const, nome: adminUser.nome || adminUser.usuario, adminUserId: adminUser.id };
     setAuth(session);
     storeAuthSession(session);
   };
 
-  const loginSchool = (credentials: AdminCredentials) => {
-    const usuario = uppercaseInput(credentials.usuario.trim());
-    const senha = credentials.senha.trim();
-    const school = data.escolas.find((account) => account.usuario === usuario && account.senha === senha);
-    if (!school) {
-      window.alert("Usuario ou senha da escola incorretos.");
+  const changeAdminPassword = (currentPassword: string, nextPassword: string, confirmation: string) => {
+    if (!adminCredentials) {
+      window.alert("Acesso restrito nao localizado.");
+      return false;
+    }
+    if (currentPassword.trim() !== adminCredentials.senha) {
+      window.alert("Senha atual incorreta.");
+      return false;
+    }
+    const cleanPassword = nextPassword.trim();
+    if (cleanPassword.length < 6) {
+      window.alert("A nova senha precisa ter pelo menos 6 caracteres.");
+      return false;
+    }
+    if (cleanPassword !== confirmation.trim()) {
+      window.alert("As senhas nao conferem.");
+      return false;
+    }
+    if (cleanPassword === adminCredentials.senha) {
+      window.alert("Informe uma senha diferente da atual.");
+      return false;
+    }
+    const nextAdmin = { ...adminCredentials, senha: cleanPassword };
+    window.localStorage.setItem(adminStorageKey, JSON.stringify(nextAdmin));
+    setAdminCredentials(nextAdmin);
+    const nextData = { ...data, admin: nextAdmin };
+    setData(nextData);
+    void persistData(nextData, "Senha alterada");
+    return true;
+  };
+
+  const changeManagerFirstPassword = (password: string) => {
+    if (auth?.role !== "manager" || !auth.adminUserId) return;
+    const cleanPassword = password.trim();
+    if (cleanPassword.length < 6 || cleanPassword === "123456") {
+      window.alert("Crie uma senha com pelo menos 6 caracteres e diferente da senha provisoria.");
       return;
     }
-    const session = { role: "school" as const, nome: school.usuario, schoolId: school.id };
+    const nextData = {
+      ...data,
+      adminUsers: (data.adminUsers ?? []).map((user) => user.id === auth.adminUserId
+        ? { ...user, senha: cleanPassword, mustChangePassword: false }
+        : user),
+    };
+    setData(nextData);
+    void persistData(nextData, "Senha alterada");
+  };
+
+  const changeRestrictedOwnPassword = (currentPassword: string, nextPassword: string, confirmation: string) => {
+    if (auth?.role === "owner") return changeAdminPassword(currentPassword, nextPassword, confirmation);
+    if (auth?.role !== "manager" || !auth.adminUserId) {
+      window.alert("Acesso restrito nao localizado.");
+      return false;
+    }
+    const user = (data.adminUsers ?? []).find((item) => item.id === auth.adminUserId);
+    if (!user) {
+      window.alert("Acesso restrito nao localizado.");
+      return false;
+    }
+    if (currentPassword.trim() !== user.senha) {
+      window.alert("Senha atual incorreta.");
+      return false;
+    }
+    const cleanPassword = nextPassword.trim();
+    if (cleanPassword.length < 6) {
+      window.alert("A nova senha precisa ter pelo menos 6 caracteres.");
+      return false;
+    }
+    if (cleanPassword !== confirmation.trim()) {
+      window.alert("As senhas nao conferem.");
+      return false;
+    }
+    if (cleanPassword === user.senha) {
+      window.alert("Informe uma senha diferente da atual.");
+      return false;
+    }
+    const nextData = {
+      ...data,
+      adminUsers: (data.adminUsers ?? []).map((item) => item.id === auth.adminUserId
+        ? { ...item, senha: cleanPassword, mustChangePassword: false }
+        : item),
+    };
+    setData(nextData);
+    void persistData(nextData, "Senha alterada");
+    return true;
+  };
+
+  const createRestrictedAccess = (input: AdminUser) => {
+    if (auth?.role !== "owner") return;
+    const clean = createAdminUser({ ...input, mustChangePassword: true });
+    if (!clean.nome || !clean.usuario || !clean.senha) {
+      window.alert("Informe nome, usuario e senha.");
+      return false;
+    }
+    const nextUsers = [...(data.adminUsers ?? []), clean];
+    if (hasDuplicatedAdminAccess(adminCredentials, nextUsers)) {
+      window.alert("Ja existe esse usuario no acesso restrito.");
+      return false;
+    }
+    const nextData = { ...data, adminUsers: nextUsers };
+    setData(nextData);
+    void persistData(nextData, "Acesso criado");
+    return true;
+  };
+
+  const updateRestrictedAccess = (id: string, patch: Partial<AdminUser>) => {
+    if (auth?.role !== "owner") return;
+    const nextUsers = (data.adminUsers ?? []).map((user) => user.id === id ? createAdminUser({ ...user, ...patch, id: user.id, createdAt: user.createdAt }) : user);
+    if (hasDuplicatedAdminAccess(adminCredentials, nextUsers)) {
+      window.alert("Ja existe esse usuario no acesso restrito.");
+      return;
+    }
+    const nextData = { ...data, adminUsers: nextUsers };
+    setData(nextData);
+    void persistData(nextData, "Acesso atualizado");
+  };
+
+  const deleteRestrictedAccess = (id: string) => {
+    if (auth?.role !== "owner") return;
+    const user = (data.adminUsers ?? []).find((item) => item.id === id);
+    const name = user?.nome || user?.usuario || "este acesso";
+    if (!window.confirm(`Excluir o acesso de ${name}?`)) return;
+    const nextData = { ...data, adminUsers: (data.adminUsers ?? []).filter((item) => item.id !== id) };
+    setData(nextData);
+    void persistData(nextData, "Acesso excluido");
+  };
+
+  const loginSchool = async (credentials: SchoolLoginCredentials) => {
+    const usuario = uppercaseInput(credentials.usuario.trim());
+    const senha = credentials.senha.trim();
+    if (firebaseEnabled) {
+      try {
+        const result = await loginCloudSchool<AppData>({ usuario, senha, tipo: credentials.tipo });
+        applyCloudLogin(result.payload, result.session, result.histories as HistoryRecord[] | undefined);
+        return;
+      } catch (error) {
+        console.error("Falha no login da escola.", error);
+        window.alert("Usuario, senha ou rede da escola incorretos.");
+        return;
+      }
+    }
+    const school = data.escolas.find((account) => {
+      if (account.ativo === false) return false;
+      if (account.tipo !== credentials.tipo) return false;
+      const accessos = account.accessos?.length
+        ? account.accessos
+        : [createSchoolAccess({ usuario: account.usuario, senha: account.senha, mustChangePassword: account.mustChangePassword })];
+      return accessos.some((access) => access.usuario === usuario && access.senha === senha);
+    });
+    if (!school) {
+      window.alert("Usuario, senha ou rede da escola incorretos.");
+      return;
+    }
+    const schoolAccesses = school.accessos?.length
+      ? school.accessos
+      : [createSchoolAccess({ usuario: school.usuario, senha: school.senha, mustChangePassword: school.mustChangePassword })];
+    const access = schoolAccesses.find((item) => item.usuario === usuario && item.senha === senha)
+      ?? schoolAccesses[0]
+      ?? createSchoolAccess({ usuario: school.usuario, senha: school.senha, mustChangePassword: school.mustChangePassword });
+    const session = { role: "school" as const, nome: access.usuario, schoolId: school.id, accessId: access.id };
     setAuth(session);
     setActiveFolderId("");
     setActiveId(data.historicos.find((record) => record.schoolId === school.id)?.id ?? "");
@@ -1774,48 +2626,79 @@ function App() {
   };
 
   const logout = () => {
+    void logoutCloudSession();
     setAuth(null);
     storeAuthSession(null);
     setView("historicos");
   };
 
+  const requireSchoolProfile = () => {
+    if (schoolProfileReady) return true;
+    setView("escola");
+    window.alert("Conclua o cadastro da escola.");
+    return false;
+  };
+
   const createSchoolAccountFromAdmin = (account: SchoolAccount) => {
+    const createdId = account.id || crypto.randomUUID();
     const clean = createSchoolAccount({
       ...account,
+      id: createdId,
       usuario: uppercaseInput(account.usuario.trim()),
       senha: account.senha.trim(),
+      accessos: [
+        createSchoolAccess({
+          id: `${createdId}-principal`,
+          usuario: account.usuario,
+          senha: account.senha,
+          mustChangePassword: true,
+        }),
+      ],
       escola: {
         ...account.escola,
         nome: uppercaseInput(account.escola.nome.trim()),
       },
     });
     if (!clean.usuario || !clean.senha || !clean.escola.nome) {
-      window.alert("Informe nome da escola, usuario e senha.");
+      window.alert("Informe nome da escola, cidade, estado, usuario e senha.");
       return;
     }
-    const duplicated = data.escolas.some((school) => school.usuario === clean.usuario);
-    if (duplicated) {
-      window.alert("Ja existe uma escola com esse usuario.");
+    if (!clean.escola.municipio || !clean.escola.estado) {
+      window.alert("Informe cidade e estado da escola.");
       return;
     }
-    setData((current) => ({ ...current, escolas: [...current.escolas, clean] }));
+    const nextSchools = [...data.escolas, clean];
+    if (hasDuplicatedSchoolAccess(nextSchools)) {
+      window.alert("Ja existe esse usuario nessa rede.");
+      return;
+    }
+    setData((current) => ({ ...current, escolas: nextSchools }));
     setSaveState("Escola cadastrada");
   };
 
   const updateSchoolAccountFromAdmin = (id: string, patch: Partial<SchoolAccount> & { escola?: Partial<School> }) => {
-    setData((current) => ({
-      ...current,
-      escolas: current.escolas.map((account) =>
-        account.id === id
-          ? {
-              ...account,
-              ...patch,
-              usuario: patch.usuario ? uppercaseInput(patch.usuario) : account.usuario,
-              escola: patch.escola ? { ...account.escola, ...patch.escola } : account.escola,
-            }
-          : account,
-      ),
-    }));
+    const nextSchools = data.escolas.map((account) => {
+      if (account.id !== id) return account;
+      const patchedAccessos = patch.accessos
+        ? patch.accessos.map(createSchoolAccess).filter((access) => access.usuario)
+        : account.accessos;
+      const accessos = patchedAccessos.length ? patchedAccessos : account.accessos;
+      const primaryAccess = accessos[0] ?? createSchoolAccess({ usuario: account.usuario, senha: account.senha, mustChangePassword: account.mustChangePassword });
+      return {
+        ...account,
+        ...patch,
+        usuario: primaryAccess.usuario,
+        senha: primaryAccess.senha,
+        mustChangePassword: primaryAccess.mustChangePassword,
+        accessos,
+        escola: patch.escola ? { ...account.escola, ...patch.escola } : account.escola,
+      };
+    });
+    if (hasDuplicatedSchoolAccess(nextSchools)) {
+      window.alert("Ja existe esse usuario nessa rede.");
+      return;
+    }
+    setData((current) => ({ ...current, escolas: nextSchools }));
   };
 
   const changeFirstPassword = (password: string) => {
@@ -1827,21 +2710,34 @@ function App() {
     }
     setData((current) => ({
       ...current,
-      escolas: current.escolas.map((account) => account.id === auth.schoolId
-        ? { ...account, senha: cleanPassword, mustChangePassword: false }
-        : account),
+      escolas: current.escolas.map((account) => {
+        if (account.id !== auth.schoolId) return account;
+        const accessos = account.accessos.map((access) => access.id === auth.accessId
+          ? { ...access, senha: cleanPassword, mustChangePassword: false }
+          : access);
+        const primaryAccess = accessos[0];
+        return {
+          ...account,
+          senha: primaryAccess?.senha ?? account.senha,
+          usuario: primaryAccess?.usuario ?? account.usuario,
+          mustChangePassword: primaryAccess?.mustChangePassword ?? false,
+          accessos,
+        };
+      }),
     }));
   };
 
   const persistData = async (nextData = data, successMessage = "Dados salvos") => {
     window.localStorage.setItem(storageKey, JSON.stringify(nextData));
-    if (!firebaseEnabled) { setSaveState("Salvo neste dispositivo"); return false; }
+    if (!firebaseEnabled) { setSaveState("Salvo"); return false; }
     try {
-      await saveCloudState({ ...nextData, historicos: [] });
+      const stateSaved = await saveCloudState(cloudReadyData(nextData));
+      const historiesSaved = await saveCloudHistories(nextData.historicos.map(cloudReadyHistory));
+      if (!stateSaved || !historiesSaved) throw new Error("Falha ao salvar no banco.");
       setSaveState(successMessage);
       return true;
     }
-    catch (error) { console.error("Falha ao salvar.", error); setSaveState("Nao foi possivel salvar"); return false; }
+    catch (error) { console.error("Falha ao salvar.", error); setSaveState(saveFailureState(error)); return false; }
   };
 
   const finishHistory = async (id: string, generatePdf = false) => {
@@ -1857,7 +2753,8 @@ function App() {
     if (saved && history) {
       try {
         const { fotosHistorico: _photos, ...cloudHistory } = history;
-        await saveCloudHistory(id, cloudHistory);
+        const historySaved = await saveCloudHistory(id, cloudHistory);
+        if (!historySaved) throw new Error("Falha ao salvar o histórico.");
         setSaveState("Histórico salvo");
       } catch (error) {
         console.error("Falha ao salvar o histórico.", error);
@@ -1873,6 +2770,7 @@ function App() {
   };
 
   const sendExistingHistory = async (requestId: string, historyId: string) => {
+    if (!requireSchoolProfile()) return;
     const history = schoolRecords.find((item) => item.id === historyId);
     if (!history) return;
     const now = new Date().toISOString();
@@ -1887,6 +2785,7 @@ function App() {
   };
 
   const receiveTransferHistory = async (requestId: string, folderId: string) => {
+    if (!requireSchoolProfile()) return;
     if (!currentSchoolAccount || !folderId) return;
     const request = data.transferencias.find((item) => item.id === requestId && item.toSchoolId === currentSchoolAccount.id);
     const source = data.historicos.find((item) => item.id === request?.historyId);
@@ -1922,6 +2821,7 @@ function App() {
   };
 
   const requestTransfer = async (input: Pick<TransferRequest, "fromSchoolId" | "studentName" | "studentBirth" | "message">) => {
+    if (!requireSchoolProfile()) return;
     if (!currentSchoolAccount || input.fromSchoolId === currentSchoolAccount.id) return;
     const now = new Date().toISOString();
     const request: TransferRequest = {
@@ -1941,6 +2841,7 @@ function App() {
   };
 
   const prepareTransferHistory = async (requestId: string) => {
+    if (!requireSchoolProfile()) return;
     if (!currentSchoolAccount) return;
     const request = data.transferencias.find((item) => item.id === requestId && item.fromSchoolId === currentSchoolAccount.id);
     if (!request) return;
@@ -1978,6 +2879,7 @@ function App() {
   };
 
   const createFolder = () => {
+    if (!requireSchoolProfile()) return;
     if (!currentSchoolAccount) return;
     const nome = folderDraft.trim();
     const anoLetivo = folderYearDraft.trim();
@@ -2004,6 +2906,7 @@ function App() {
   };
 
   const moveRecordToFolder = (id: string, folderId: string) => {
+    if (!requireSchoolProfile()) return;
     const folder = data.folders.find((item) => item.id === folderId);
     setData((current) => ({
       ...current,
@@ -2014,6 +2917,7 @@ function App() {
   };
 
   const createNew = (force = false) => {
+    if (!requireSchoolProfile()) return;
     if (!currentSchoolAccount) return;
     const folder = schoolFolders.find((item) => item.id === activeFolderId);
     if (!folder) {
@@ -2042,6 +2946,7 @@ function App() {
   };
 
   const createHistoryFromPhotos = (photos: PhotoHistoryPayload) => {
+    if (!requireSchoolProfile()) return;
     if (!currentSchoolAccount) return;
     const folder = schoolFolders.find((item) => item.id === activeFolderId);
     if (!folder) {
@@ -2073,17 +2978,21 @@ function App() {
       if (activeId === id) setActiveId(next.find((record) => record.schoolId === auth?.schoolId)?.id ?? "");
       return { ...current, historicos: next };
     });
+    void deleteCloudHistory(id).catch((error) => console.error("Falha ao remover o histórico.", error));
   };
 
   const printRecord = (id: string) => {
+    const record = data.historicos.find((item) => item.id === id);
     setPrintBatch(null);
     setActiveId(id);
     setView("editor");
     setPage(1);
-    window.setTimeout(() => window.print(), 80);
+    window.setTimeout(() => printWithTitle(record?.aluno.nome || record?.codigo || "HISTORICO"), 80);
   };
 
   const savePdfForRecord = (id: string) => {
+    const record = data.historicos.find((item) => item.id === id);
+    const pdfTitle = record?.aluno.nome || record?.codigo || "HISTORICO";
     setData((current) => ({
       ...current,
       historicos: current.historicos.map((record) =>
@@ -2091,7 +3000,7 @@ function App() {
       ),
     }));
     if (active?.id === id && view === "editor") {
-      window.print();
+      printWithTitle(pdfTitle);
       return;
     }
     setPrintBatch(null);
@@ -2100,7 +3009,7 @@ function App() {
     setPage(1);
     setSaveState("Abrindo PDF...");
     window.setTimeout(() => {
-      window.print();
+      printWithTitle(pdfTitle);
       setSaveState("Salvo");
     }, 120);
   };
@@ -2112,8 +3021,9 @@ function App() {
   const printFolderUnified = () => {
     const recordsToPrint = recordsForActiveFolder();
     if (!recordsToPrint.length) return;
+    const folder = schoolFolders.find((item) => item.id === activeFolderId);
     setPrintBatch(recordsToPrint);
-    window.setTimeout(() => window.print(), 120);
+    window.setTimeout(() => printWithTitle(folder ? `${folder.anoLetivo} ${folder.nome}` : "TODOS OS HISTORICOS"), 120);
   };
 
   const downloadFolderData = () => {
@@ -2186,7 +3096,7 @@ function App() {
   const importFolderFromComputer = async () => {
     const picker = (window as DirectoryPickerWindow).showDirectoryPicker;
     if (!picker) {
-      window.alert("Este navegador nao permite abrir pasta do PC. Use Chrome ou Edge atualizado.");
+      window.alert("Este navegador nao permite escolher uma pasta. Use a opcao de baixar.");
       return;
     }
 
@@ -2205,7 +3115,7 @@ function App() {
       }
 
       if (!imports.length) {
-        window.alert("Nao encontrei historicos JSON nessa pasta.");
+        window.alert("Nao encontrei historicos nessa pasta.");
         return;
       }
 
@@ -2238,10 +3148,22 @@ function App() {
     }
   };
 
+  if (!isReady) {
+    return (
+      <main className="login-page">
+        <section className="login-card">
+          <p className="eyebrow">Históricos Escolares</p>
+          <h1>Historico Online</h1>
+          <p>Carregando acesso...</p>
+        </section>
+      </main>
+    );
+  }
+
   if (!auth) {
     return (
       <LoginScreen
-        hasAdmin={Boolean(adminCredentials)}
+        hasAdmin={Boolean(adminCredentials) || cloudHasAdmin}
         onCreateAdmin={createAdminAccess}
         onLoginAdmin={loginAdmin}
         onLoginSchool={loginSchool}
@@ -2249,20 +3171,33 @@ function App() {
     );
   }
 
-  if (auth.role === "owner") {
+  if (currentAdminUser?.mustChangePassword) {
+    return <FirstAccessPassword schoolName={currentAdminUser.nome || currentAdminUser.usuario} onSave={changeManagerFirstPassword} onLogout={logout} />;
+  }
+
+  if (auth.role === "owner" || auth.role === "manager") {
     return (
       <OwnerDashboard
         schools={data.escolas}
+        folders={data.folders}
+        histories={data.historicos}
+        adminUsers={data.adminUsers ?? []}
+        schoolDirectory={schoolDirectory}
+        accessRole={auth.role}
+        accessName={auth.nome}
         saveState={saveState}
         onCreateSchool={createSchoolAccountFromAdmin}
         onUpdateSchool={updateSchoolAccountFromAdmin}
+        onChangeOwnPassword={changeRestrictedOwnPassword}
+        onCreateRestrictedAccess={createRestrictedAccess}
+        onUpdateRestrictedAccess={updateRestrictedAccess}
+        onDeleteRestrictedAccess={deleteRestrictedAccess}
         onLogout={logout}
       />
     );
   }
 
-
-  if (currentSchoolAccount?.mustChangePassword) {
+  if (currentSchoolAccess?.mustChangePassword) {
     return <FirstAccessPassword schoolName={currentSchool.nome} onSave={changeFirstPassword} onLogout={logout} />;
   }
 
@@ -2270,28 +3205,29 @@ function App() {
     <main className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <span className="brand-mark">HE</span>
+          {currentSchool.logoSistema ? <img className="brand-logo" src={currentSchool.logoSistema} alt="" /> : <span className="brand-mark">HE</span>}
           <div>
             <strong>Histórico Escolar</strong>
             <small>Gestão educacional</small>
           </div>
         </div>
-        <button className={view === "historicos" ? "nav active" : "nav"} onClick={() => setView("historicos")}>
-          <span className="nav-icon">▦</span> Históricos
-        </button>
-        <button className={view === "alunos" ? "nav active" : "nav"} onClick={() => setView("alunos")}>
-          <span className="nav-icon">◎</span> Alunos
-        </button>
-        <button className={view === "transferencias" ? "nav active" : "nav"} onClick={() => setView("transferencias")}>
-          <span className="nav-icon">⇄</span> Transferências
-          {incomingTransfers.length > 0 && <span className="nav-badge">{incomingTransfers.length}</span>}
-        </button>
-        <button className={view === "novo" || view === "editor" ? "nav active" : "nav"} onClick={() => setView("novo")}>
-          <span className="nav-icon">＋</span> Novo histórico
-        </button>
-        <button className={view === "turmas" ? "nav active" : "nav"} onClick={() => setView("turmas")}>
-          <span className="nav-icon">◇</span> Turmas
-        </button>
+        {schoolProfileReady && (
+          <>
+            <button className={view === "historicos" ? "nav active" : "nav"} onClick={() => setView("historicos")}>
+              <span className="nav-icon">▦</span> Históricos
+            </button>
+            <button className={view === "alunos" ? "nav active" : "nav"} onClick={() => setView("alunos")}>
+              <span className="nav-icon">◎</span> Alunos
+            </button>
+            <button className={view === "transferencias" ? "nav active" : "nav"} onClick={() => setView("transferencias")}>
+              <span className="nav-icon">⇄</span> Transferências
+              {incomingTransfers.length > 0 && <span className="nav-badge">{incomingTransfers.length}</span>}
+            </button>
+            <button className={view === "turmas" ? "nav active" : "nav"} onClick={() => setView("turmas")}>
+              <span className="nav-icon">◇</span> Turmas
+            </button>
+          </>
+        )}
         <div className="sidebar-rule" />
         <button
           className={view === "escola" ? "nav active" : "nav"}
@@ -2301,18 +3237,22 @@ function App() {
         >
           <span className="nav-icon">⌂</span> Dados da escola
         </button>
-        <div className="sidebar-rule" />
-        <div className="folder-panel">
-          <strong>Pastas / Turmas</strong>
-          <button className={!activeFolderId ? "folder-link active" : "folder-link"} onClick={() => { setActiveFolderId(""); setView("historicos"); }}>
-            Todas
-          </button>
-          {schoolFolders.map((folder) => (
-            <button key={folder.id} className={activeFolderId === folder.id ? "folder-link active" : "folder-link"} onClick={() => { setActiveFolderId(folder.id); setView("historicos"); }}>
-              {folder.anoLetivo} - {folder.nome}
-            </button>
-          ))}
-        </div>
+        {schoolProfileReady && (
+          <>
+            <div className="sidebar-rule" />
+            <div className="folder-panel">
+              <strong>Pastas / Turmas</strong>
+              <button className={!activeFolderId ? "folder-link active" : "folder-link"} onClick={() => { setActiveFolderId(""); setView("historicos"); }}>
+                Todas
+              </button>
+              {schoolFolders.map((folder) => (
+                <button key={folder.id} className={activeFolderId === folder.id ? "folder-link active" : "folder-link"} onClick={() => { setActiveFolderId(folder.id); setView("historicos"); }}>
+                  {folder.anoLetivo} - {folder.nome}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
         <div className="firebase-note">
           <strong>{auth.nome}</strong>
           <span>{upper(currentSchool.nome)}<br />{currentSchoolAccount?.tipo === "estadual" ? "Escola estadual" : "Escola municipal"}</span>
@@ -2334,13 +3274,13 @@ function App() {
             }</p>
             <h1>Historico Online</h1>
             <div className="school-chip">
-              {currentSchool.logo && <img src={currentSchool.logo} alt="" />}
+              {currentSchool.logoSistema && <img src={currentSchool.logoSistema} alt="" />}
               <span>{upper(currentSchool.nome)}</span>
             </div>
           </div>
           <div className="actions">
             <span className="save-state">{saveState === "Salvo" ? "OK Salvo" : saveState}</span>
-            {view === "editor" && active && (
+            {schoolProfileReady && view === "editor" && active && (
               <label className="topbar-folder">
                 <span>Pasta</span>
                 <select value={active.folderId} onChange={(event) => moveRecordToFolder(active.id, event.target.value)}>
@@ -2349,20 +3289,20 @@ function App() {
                 </select>
               </label>
             )}
-            {view === "editor" && active && (
+            {schoolProfileReady && view === "editor" && active && (
               <button className="primary" onClick={() => savePdfForRecord(active.id)}>Gerar PDF</button>
             )}
           </div>
         </header>
 
-        {incomingTransfers.length > 0 && view !== "transferencias" && (
+        {schoolProfileReady && incomingTransfers.length > 0 && view !== "transferencias" && (
           <button className="transfer-alert-card" type="button" onClick={() => setView("transferencias")}>
             <span className="transfer-alert-icon">!</span>
             <span><strong>{data.escolas.find((school) => school.id === incomingTransfers[0].toSchoolId)?.escola.nome || "Outra escola"}</strong> solicitou o histórico de <strong>{incomingTransfers[0].studentName}</strong>.</span>
             <span className="transfer-alert-action">Ver solicitação →</span>
           </button>
         )}
-        {receivedTransferNotices.length > 0 && view !== "transferencias" && (
+        {schoolProfileReady && receivedTransferNotices.length > 0 && view !== "transferencias" && (
           <button className="transfer-alert-card received" type="button" onClick={() => setView("transferencias")}>
             <span className="transfer-alert-icon">✓</span>
             <span><strong>{data.escolas.find((school) => school.id === receivedTransferNotices[0].fromSchoolId)?.escola.nome || "Escola de origem"}</strong> enviou o histórico de <strong>{receivedTransferNotices[0].studentName}</strong>.</span>
@@ -2370,7 +3310,7 @@ function App() {
           </button>
         )}
 
-        {view === "historicos" && (
+        {schoolProfileReady && view === "historicos" && (
           <HistoryList
             query={query}
             setQuery={setQuery}
@@ -2401,7 +3341,7 @@ function App() {
           />
         )}
 
-        {view === "novo" && (
+        {schoolProfileReady && view === "novo" && (
           <NewHistoryScreen
             school={currentSchool}
             schoolId={currentSchoolAccount?.id ?? ""}
@@ -2414,7 +3354,7 @@ function App() {
           />
         )}
 
-        {view === "turmas" && (
+        {schoolProfileReady && view === "turmas" && (
           <ClassroomScreen
             folders={schoolFolders}
             folderDraft={folderDraft}
@@ -2433,7 +3373,7 @@ function App() {
           />
         )}
 
-        {view === "alunos" && (
+        {schoolProfileReady && view === "alunos" && (
           <StudentsArchive
             records={schoolRecords}
             folders={schoolFolders}
@@ -2445,7 +3385,7 @@ function App() {
           />
         )}
 
-        {view === "transferencias" && currentSchoolAccount && (
+        {schoolProfileReady && view === "transferencias" && currentSchoolAccount && (
           <TransfersScreen
             currentSchool={currentSchoolAccount}
             schools={data.escolas}
@@ -2461,9 +3401,9 @@ function App() {
           />
         )}
 
-        {view === "escola" && <SchoolSettings school={currentSchool} updateSchool={updateSchool} onSave={() => void persistData(data, "Dados da escola salvos")} />}
+        {view === "escola" && <SchoolSettings school={currentSchool} schoolDirectory={schoolDirectory} updateSchool={updateSchool} onSave={() => void persistData(data, "Dados da escola salvos")} />}
 
-        {view === "editor" && active && (
+        {schoolProfileReady && view === "editor" && active && (
           <div className="editor-grid">
             <section className="form-pane">
               <Progress step={step} setStep={setStep} />
@@ -2483,6 +3423,7 @@ function App() {
                 step={step}
                 updateActive={updateActive}
                 updateSchool={updateSchool}
+                schoolDirectory={schoolDirectory}
                 setStep={setStep}
                 finishHistory={finishHistory}
               />
@@ -2532,12 +3473,13 @@ function LoginScreen({
   hasAdmin: boolean;
   onCreateAdmin: (credentials: AdminCredentials) => void;
   onLoginAdmin: (credentials: AdminCredentials) => void;
-  onLoginSchool: (credentials: AdminCredentials) => void;
+  onLoginSchool: (credentials: SchoolLoginCredentials) => void;
 }) {
   const [adminUser, setAdminUser] = useState("ADMIN");
   const [adminPassword, setAdminPassword] = useState("");
   const [schoolUser, setSchoolUser] = useState("");
   const [schoolPassword, setSchoolPassword] = useState("");
+  const [schoolKind, setSchoolKind] = useState<SchoolKind>("municipal");
 
   return (
     <main className="login-shell">
@@ -2545,8 +3487,8 @@ function LoginScreen({
         <div className="login-brand">
           <span className="brand-mark">HE</span>
           <div>
-            <p>Plataforma de gestão escolar</p>
-            <h1>Histórico Escolar Online</h1>
+            <p>Sistema escolar</p>
+            <h1>Historico Online</h1>
           </div>
         </div>
 
@@ -2554,10 +3496,21 @@ function LoginScreen({
           <form
             onSubmit={(event) => {
               event.preventDefault();
-              onLoginSchool({ usuario: schoolUser, senha: schoolPassword });
+              onLoginSchool({ usuario: schoolUser, senha: schoolPassword, tipo: schoolKind });
             }}
           >
-            <div className="login-heading"><span>Portal da escola</span><h2>Acesse sua unidade</h2><p>Consulte alunos, turmas e emita históricos escolares.</p></div>
+            <div className="login-heading"><span>Login</span><h2>Acesso da escola</h2></div>
+            <div className="school-kind login-school-kind">
+              <span>Rede da escola</span>
+              <label>
+                <input type="checkbox" checked={schoolKind === "municipal"} onChange={() => setSchoolKind("municipal")} />
+                Municipal
+              </label>
+              <label>
+                <input type="checkbox" checked={schoolKind === "estadual"} onChange={() => setSchoolKind("estadual")} />
+                Estadual
+              </label>
+            </div>
             <label>
               <span>Usuario da escola</span>
               <input value={schoolUser} onChange={(event) => setSchoolUser(uppercaseInput(event.target.value))} placeholder="ESCOLA001" />
@@ -2566,7 +3519,7 @@ function LoginScreen({
               <span>Senha</span>
               <input type="password" value={schoolPassword} onChange={(event) => setSchoolPassword(event.target.value)} />
             </label>
-            <button className="primary login-submit" type="submit">Entrar no portal <span>→</span></button>
+            <button className="primary login-submit" type="submit">Entrar <span>→</span></button>
           </form>
 
           <form
@@ -2577,16 +3530,16 @@ function LoginScreen({
               else onCreateAdmin(credentials);
             }}
           >
-            <div className="login-heading"><span>Área restrita</span><h2>{hasAdmin ? "Superadministrador" : "Criar superadministrador"}</h2><p>Gerencie as escolas e os acessos da plataforma.</p></div>
+            <div className="login-heading"><span>Restrito</span><h2>Acesso restrito</h2></div>
             <label>
-              <span>Usuario do dono</span>
+              <span>Usuario</span>
               <input value={adminUser} onChange={(event) => setAdminUser(uppercaseInput(event.target.value))} />
             </label>
             <label>
               <span>Senha</span>
               <input type="password" value={adminPassword} onChange={(event) => setAdminPassword(event.target.value)} />
             </label>
-            <button className="login-submit secondary" type="submit">{hasAdmin ? "Acessar administração" : "Criar acesso principal"} <span>→</span></button>
+            <button className="login-submit secondary" type="submit">Entrar <span>→</span></button>
           </form>
         </div>
       </section>
@@ -2602,9 +3555,9 @@ function FirstAccessPassword({ schoolName, onSave, onLogout }: { schoolName: str
       <section className="first-access-card">
         <div className="security-badge">✓</div>
         <span className="eyebrow">Primeiro acesso</span>
-        <h1>Proteja a conta da escola</h1>
+        <h1>Definir senha</h1>
         <p>{upper(schoolName)}</p>
-        <div className="security-notice">A senha provisória <strong>123456</strong> deve ser substituída antes de continuar.</div>
+        <div className="security-notice">Senha provisória: <strong>123456</strong></div>
         <form onSubmit={(event) => { event.preventDefault(); if (password !== confirmation) { window.alert("As senhas nao conferem."); return; } onSave(password); }}>
           <label><span>Nova senha</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" /></label>
           <label><span>Confirmar nova senha</span><input type="password" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="new-password" /></label>
@@ -2618,26 +3571,101 @@ function FirstAccessPassword({ schoolName, onSave, onLogout }: { schoolName: str
 
 function OwnerDashboard({
   schools,
+  folders,
+  histories,
+  adminUsers,
+  schoolDirectory,
+  accessRole,
+  accessName,
   saveState,
   onCreateSchool,
   onUpdateSchool,
+  onChangeOwnPassword,
+  onCreateRestrictedAccess,
+  onUpdateRestrictedAccess,
+  onDeleteRestrictedAccess,
   onLogout,
 }: {
   schools: SchoolAccount[];
+  folders: Folder[];
+  histories: HistoryRecord[];
+  adminUsers: AdminUser[];
+  schoolDirectory: SchoolDirectoryItem[];
+  accessRole: "owner" | "manager";
+  accessName: string;
   saveState: string;
   onCreateSchool: (account: SchoolAccount) => void;
   onUpdateSchool: (id: string, patch: Partial<SchoolAccount> & { escola?: Partial<School> }) => void;
+  onChangeOwnPassword: (currentPassword: string, nextPassword: string, confirmation: string) => boolean;
+  onCreateRestrictedAccess: (input: AdminUser) => boolean | void;
+  onUpdateRestrictedAccess: (id: string, patch: Partial<AdminUser>) => void;
+  onDeleteRestrictedAccess: (id: string) => void;
   onLogout: () => void;
 }) {
+  const [adminView, setAdminView] = useState<"overview" | "schools" | "access" | "password">("overview");
   const [draft, setDraft] = useState(() => createSchoolAccount({
     usuario: "",
     senha: "123456",
     tipo: "municipal",
     escola: { ...emptySchool },
   }));
+  const [accessDrafts, setAccessDrafts] = useState<Record<string, string>>({});
+  const [passwordDraft, setPasswordDraft] = useState({ atual: "", nova: "", confirmar: "" });
+  const [restrictedDraft, setRestrictedDraft] = useState(() => createAdminUser({ senha: "123456" }));
+  const [schoolSearch, setSchoolSearch] = useState("");
+  const canManageRestricted = accessRole === "owner";
+  const activeSchools = schools.filter((account) => account.ativo !== false);
+  const inactiveSchools = schools.filter((account) => account.ativo === false);
+  const completedSchools = schools.filter((account) => isSchoolProfileReady(account.escola));
+  const municipalCount = schools.filter((account) => account.tipo === "municipal").length;
+  const estadualCount = schools.filter((account) => account.tipo === "estadual").length;
+  const accessCount = schools.reduce((total, account) => total + account.accessos.length, 0);
+  const activeManagers = adminUsers.filter((user) => user.ativo).length;
+  const schoolNeedle = schoolSearch.trim().toLocaleLowerCase("pt-BR");
+  const filteredSchools = schools.filter((account) => {
+    if (!schoolNeedle) return true;
+    const searchable = [
+      account.escola.nome,
+      account.escola.codigo,
+      account.escola.municipio,
+      account.escola.estado,
+      account.tipo === "estadual" ? "estadual" : "municipal",
+      account.ativo === false ? "inativa bloqueada" : "ativa liberada",
+      ...account.accessos.map((access) => access.usuario),
+    ].join(" ").toLocaleLowerCase("pt-BR");
+    return searchable.includes(schoolNeedle);
+  });
 
   const updateDraftSchool = (patch: Partial<School>) => {
     setDraft((current) => ({ ...current, escola: { ...current.escola, ...patch } }));
+  };
+
+  const updateAccess = (account: SchoolAccount, accessId: string, patch: Partial<SchoolAccess>) => {
+    onUpdateSchool(account.id, {
+      accessos: account.accessos.map((access) => access.id === accessId ? { ...access, ...patch } : access),
+    });
+  };
+
+  const addAccess = (account: SchoolAccount) => {
+    const usuario = uppercaseInput((accessDrafts[account.id] || "").trim());
+    if (!usuario) {
+      window.alert("Informe o usuario do acesso.");
+      return;
+    }
+    onUpdateSchool(account.id, {
+      accessos: [...account.accessos, createSchoolAccess({ usuario, senha: "123456", mustChangePassword: true })],
+    });
+    setAccessDrafts((current) => ({ ...current, [account.id]: "" }));
+  };
+
+  const removeAccess = (account: SchoolAccount, accessId: string) => {
+    if (account.accessos.length <= 1) {
+      window.alert("A escola precisa ter pelo menos um acesso.");
+      return;
+    }
+    onUpdateSchool(account.id, {
+      accessos: account.accessos.filter((access) => access.id !== accessId),
+    });
   };
 
   return (
@@ -2646,15 +3674,19 @@ function OwnerDashboard({
         <div className="brand">
           <span className="brand-mark">HE</span>
           <div>
-            <strong>Histórico Escolar</strong>
-            <small>Superadministração</small>
+            <strong>Historico Online</strong>
+            <small>Painel restrito</small>
           </div>
         </div>
-        <button className="nav active"><span className="nav-icon">⌂</span> Escolas</button>
-        <button className="nav"><span className="nav-icon">◎</span> Visão geral</button>
+        <button className={adminView === "overview" ? "nav active" : "nav"} onClick={() => setAdminView("overview")}><span className="nav-icon">◎</span> Visão geral</button>
+        <button className={adminView === "schools" ? "nav active" : "nav"} onClick={() => setAdminView("schools")}><span className="nav-icon">⌂</span> Escolas</button>
+        {canManageRestricted && (
+          <button className={adminView === "access" ? "nav active" : "nav"} onClick={() => setAdminView("access")}><span className="nav-icon">◈</span> Acessos</button>
+        )}
         <div className="firebase-note">
-          <strong>SUPERADMINISTRADOR</strong>
-          <span>Acesso exclusivo para controlar escolas e credenciais.</span>
+          <strong>{upper(accessName)}</strong>
+          <span>{canManageRestricted ? "Controle principal" : "Gestão educacional"}</span>
+          <button type="button" onClick={() => setAdminView("password")}>Minha senha</button>
           <button type="button" onClick={onLogout}>Sair</button>
         </div>
       </aside>
@@ -2662,25 +3694,240 @@ function OwnerDashboard({
       <section className="workspace">
         <header className="topbar">
           <div>
-            <p>Central de administração</p>
-            <h1>Gestão de escolas</h1>
+            <p>Painel restrito</p>
+            <h1>{adminView === "overview" ? "Visão geral" : adminView === "access" ? "Acessos do sistema" : adminView === "password" ? "Minha senha" : "Gestão de escolas"}</h1>
           </div>
           <span className="save-state">{saveState === "Salvo" ? "OK Salvo" : saveState}</span>
         </header>
 
+        {adminView === "overview" && (
+          <section className="overview-screen">
+            <div className="overview-cards">
+              <article><span>Escolas cadastradas</span><strong>{schools.length}</strong></article>
+              <article><span>Municipais</span><strong>{municipalCount}</strong></article>
+              <article><span>Estaduais</span><strong>{estadualCount}</strong></article>
+              <article><span>Acessos das escolas</span><strong>{accessCount}</strong></article>
+              <article><span>Escolas ativas</span><strong>{activeSchools.length}</strong></article>
+              <article><span>Escolas inativas</span><strong>{inactiveSchools.length}</strong></article>
+              <article><span>Cadastros completos</span><strong>{completedSchools.length}</strong></article>
+              <article><span>Responsáveis</span><strong>{adminUsers.length}</strong></article>
+              <article><span>Responsáveis ativos</span><strong>{activeManagers}</strong></article>
+            </div>
+            <section className="list-screen admin-list">
+              <div className="panel-heading">
+                <h2>Escolas usando o sistema</h2>
+              </div>
+              <label className="admin-search">
+                <span>Pesquisar escola</span>
+                <input value={schoolSearch} onChange={(event) => setSchoolSearch(uppercaseInput(event.target.value))} placeholder="Nome, INEP, cidade, rede ou usuario" />
+              </label>
+              <table className="records-table">
+                <thead>
+                  <tr>
+                    <th>Situação</th>
+                    <th>Escola</th>
+                    <th>Rede</th>
+                    <th>INEP</th>
+                    <th>Localidade</th>
+                    <th>Turmas</th>
+                    <th>Históricos</th>
+                    <th>Acessos</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredSchools.map((account) => {
+                    const schoolFolders = folders.filter((folder) => folder.schoolId === account.id);
+                    const schoolHistories = histories.filter((record) => record.schoolId === account.id);
+                    return (
+                      <tr key={account.id}>
+                        <td><span className={account.ativo === false ? "status-pill inactive" : "status-pill active"}><i />{account.ativo === false ? "Inativa" : "Ativa"}</span></td>
+                        <td>{upper(account.escola.nome) || "-"}</td>
+                        <td>{account.tipo === "estadual" ? "Estadual" : "Municipal"}</td>
+                        <td>{upper(account.escola.codigo) || "-"}</td>
+                        <td>{[account.escola.municipio, account.escola.estado].filter(Boolean).map(upper).join(" - ") || "-"}</td>
+                        <td>{schoolFolders.length}</td>
+                        <td>{schoolHistories.length}</td>
+                        <td>{account.accessos.length}</td>
+                      </tr>
+                    );
+                  })}
+                  {!filteredSchools.length && (
+                    <tr>
+                      <td colSpan={8}>Nenhuma escola encontrada.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </section>
+            <section className="list-screen admin-list">
+              <div className="panel-heading">
+                <h2>Responsáveis cadastrados</h2>
+              </div>
+              <table className="records-table">
+                <thead>
+                  <tr>
+                    <th>Situação</th>
+                    <th>Nome</th>
+                    <th>Usuario</th>
+                    <th>CREDE</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {adminUsers.map((user) => (
+                    <tr key={user.id}>
+                      <td><span className={user.ativo ? "status-pill active" : "status-pill inactive"}><i />{user.ativo ? "Ativo" : "Bloqueado"}</span></td>
+                      <td>{upper(user.nome) || "-"}</td>
+                      <td>{upper(user.usuario) || "-"}</td>
+                      <td>{upper(user.crede) || "-"}</td>
+                    </tr>
+                  ))}
+                  {!adminUsers.length && (
+                    <tr>
+                      <td colSpan={4}>Nenhum responsável cadastrado ainda.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </section>
+          </section>
+        )}
+
+        {adminView === "password" && (
+        <section className="settings-screen admin-security">
+          <div className="panel-heading">
+            <h2>Minha senha</h2>
+          </div>
+          <form
+            className="settings-grid"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const changed = onChangeOwnPassword(passwordDraft.atual, passwordDraft.nova, passwordDraft.confirmar);
+              if (changed) setPasswordDraft({ atual: "", nova: "", confirmar: "" });
+            }}
+          >
+            <label>
+              <span>Senha atual</span>
+              <input type="password" value={passwordDraft.atual} onChange={(event) => setPasswordDraft((current) => ({ ...current, atual: event.target.value }))} autoComplete="current-password" />
+            </label>
+            <label>
+              <span>Nova senha</span>
+              <input type="password" value={passwordDraft.nova} onChange={(event) => setPasswordDraft((current) => ({ ...current, nova: event.target.value }))} autoComplete="new-password" />
+            </label>
+            <label>
+              <span>Confirmar nova senha</span>
+              <input type="password" value={passwordDraft.confirmar} onChange={(event) => setPasswordDraft((current) => ({ ...current, confirmar: event.target.value }))} autoComplete="new-password" />
+            </label>
+            <button className="primary" type="submit">Alterar senha</button>
+          </form>
+        </section>
+        )}
+
+        {canManageRestricted && adminView === "access" && (
+        <section className="settings-screen admin-security">
+          <div className="panel-heading">
+            <h2>Responsáveis da educação</h2>
+          </div>
+          <form
+            className="settings-grid"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const created = onCreateRestrictedAccess(restrictedDraft);
+              if (created) setRestrictedDraft(createAdminUser({ senha: "123456" }));
+            }}
+          >
+            <label>
+              <span>Nome</span>
+              <input value={restrictedDraft.nome} onChange={(event) => setRestrictedDraft((current) => ({ ...current, nome: uppercaseInput(event.target.value) }))} />
+            </label>
+            <label>
+              <span>Usuario</span>
+              <input value={restrictedDraft.usuario} onChange={(event) => setRestrictedDraft((current) => ({ ...current, usuario: uppercaseInput(event.target.value) }))} />
+            </label>
+            <label>
+              <span>CREDE</span>
+              <select value={restrictedDraft.crede} onChange={(event) => setRestrictedDraft((current) => ({ ...current, crede: event.target.value }))}>
+                {credeOptions.map((crede) => <option key={crede} value={crede}>{crede}</option>)}
+              </select>
+            </label>
+            <label>
+              <span>Senha provisória</span>
+              <input value={restrictedDraft.senha} onChange={(event) => setRestrictedDraft((current) => ({ ...current, senha: event.target.value }))} />
+            </label>
+            <button className="primary" type="submit">Criar acesso</button>
+          </form>
+          <table className="records-table restricted-table">
+            <thead>
+              <tr>
+                <th>Nome</th>
+                <th>Usuario</th>
+                <th>CREDE</th>
+                <th>Situação</th>
+                <th>Ações</th>
+              </tr>
+            </thead>
+            <tbody>
+              {adminUsers.map((user) => (
+                <tr key={user.id}>
+                  <td><input value={user.nome} onChange={(event) => onUpdateRestrictedAccess(user.id, { nome: uppercaseInput(event.target.value) })} /></td>
+                  <td><input value={user.usuario} onChange={(event) => onUpdateRestrictedAccess(user.id, { usuario: uppercaseInput(event.target.value) })} /></td>
+                  <td>
+                    <select value={user.crede} onChange={(event) => onUpdateRestrictedAccess(user.id, { crede: event.target.value })}>
+                      {credeOptions.map((crede) => <option key={crede} value={crede}>{crede}</option>)}
+                    </select>
+                  </td>
+                  <td>
+                    <label className="status-toggle">
+                      <input type="checkbox" checked={user.ativo} onChange={(event) => onUpdateRestrictedAccess(user.id, { ativo: event.target.checked })} />
+                      {user.ativo ? "Ativo" : "Bloqueado"}
+                    </label>
+                  </td>
+                  <td>
+                    <div className="restricted-actions">
+                      <button type="button" className="reset-password" onClick={() => onUpdateRestrictedAccess(user.id, { senha: "123456", mustChangePassword: true })}>Redefinir senha</button>
+                      <button type="button" className="reset-password danger" onClick={() => onDeleteRestrictedAccess(user.id)}>Excluir</button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+              {!adminUsers.length && (
+                <tr>
+                  <td colSpan={5}>Nenhum responsável cadastrado ainda.</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </section>
+        )}
+
+        {adminView === "schools" && (
+        <>
         <section className="settings-screen">
           <div className="panel-heading">
             <h2>Cadastrar escola</h2>
-            <p>Crie o usuario e senha que a escola vai usar para entrar no sistema.</p>
           </div>
           <div className="settings-grid">
             <label className="wide">
               <span>Nome da escola</span>
-              <input value={draft.escola.nome} onChange={(event) => updateDraftSchool({ nome: uppercaseInput(event.target.value) })} />
+              <SchoolNameInput
+                value={draft.escola.nome}
+                onChange={(value) => updateDraftSchool({ nome: value })}
+                municipio={draft.escola.municipio}
+                estado={draft.escola.estado}
+                schoolDirectory={schoolDirectory}
+              />
             </label>
             <label>
-              <span>Codigo INEP / Censo</span>
+              <span>Codigo INEP</span>
               <input value={draft.escola.codigo} onChange={(event) => updateDraftSchool({ codigo: uppercaseInput(event.target.value) })} />
+            </label>
+            <LocationFields
+              estado={draft.escola.estado}
+              municipio={draft.escola.municipio}
+              onChange={(patch) => updateDraftSchool(patch)}
+            />
+            <label className="wide">
+              <span>Entidade mantenedora</span>
+              <input value={draft.escola.mantenedora} onChange={(event) => updateDraftSchool({ mantenedora: uppercaseInput(event.target.value) })} />
             </label>
             <label>
               <span>Usuario da escola</span>
@@ -2689,7 +3936,6 @@ function OwnerDashboard({
             <label>
               <span>Senha provisória</span>
               <input value="123456" readOnly aria-label="Senha provisoria padrao" />
-              <small className="field-help">A escola deverá criar uma nova senha no primeiro acesso.</small>
             </label>
             <div className="school-kind">
               <span>Rede da escola</span>
@@ -2715,7 +3961,7 @@ function OwnerDashboard({
               }));
             }}
           >
-            Criar conta da escola
+            Cadastrar escola
           </button>
         </section>
 
@@ -2723,19 +3969,29 @@ function OwnerDashboard({
           <div className="panel-heading">
             <h2>Escolas cadastradas</h2>
           </div>
+          <label className="admin-search">
+            <span>Pesquisar escola</span>
+            <input value={schoolSearch} onChange={(event) => setSchoolSearch(uppercaseInput(event.target.value))} placeholder="Nome, INEP, cidade, rede ou usuario" />
+          </label>
           <table className="records-table">
             <thead>
               <tr>
+                <th>Situação</th>
                 <th>Escola</th>
-                <th>Censo</th>
-                <th>Usuario</th>
+                <th>INEP</th>
                 <th>Rede</th>
-                <th>Acesso</th>
+                <th>Acessos</th>
               </tr>
             </thead>
             <tbody>
-              {schools.map((account) => (
+              {filteredSchools.map((account) => (
                 <tr key={account.id}>
+                  <td>
+                    <label className="status-toggle school-status-toggle">
+                      <input type="checkbox" checked={account.ativo !== false} onChange={(event) => onUpdateSchool(account.id, { ativo: event.target.checked })} />
+                      <span className={account.ativo === false ? "status-pill inactive" : "status-pill active"}><i />{account.ativo === false ? "Inativa" : "Ativa"}</span>
+                    </label>
+                  </td>
                   <td>
                     <input
                       value={account.escola.nome}
@@ -2746,27 +4002,52 @@ function OwnerDashboard({
                     <input value={account.escola.codigo} onChange={(event) => onUpdateSchool(account.id, { escola: { codigo: uppercaseInput(event.target.value) } })} />
                   </td>
                   <td>
-                    <input value={account.usuario} onChange={(event) => onUpdateSchool(account.id, { usuario: uppercaseInput(event.target.value) })} />
-                  </td>
-                  <td>
                     <select value={account.tipo} onChange={(event) => onUpdateSchool(account.id, { tipo: event.target.value as SchoolKind })}>
                       <option value="municipal">Municipal</option>
                       <option value="estadual">Estadual</option>
                     </select>
                   </td>
                   <td>
-                    <button type="button" className="reset-password" onClick={() => onUpdateSchool(account.id, { senha: "123456", mustChangePassword: true })}>Redefinir para 123456</button>
+                    <div className="access-list">
+                      {account.accessos.map((access, index) => (
+                        <div className="access-row" key={access.id}>
+                          <input
+                            value={access.usuario}
+                            aria-label={`Usuario ${index + 1}`}
+                            onChange={(event) => updateAccess(account, access.id, { usuario: uppercaseInput(event.target.value) })}
+                          />
+                          <button
+                            type="button"
+                            className="reset-password"
+                            onClick={() => updateAccess(account, access.id, { senha: "123456", mustChangePassword: true })}
+                          >
+                            Redefinir
+                          </button>
+                          <button type="button" className="reset-password danger" onClick={() => removeAccess(account, access.id)}>Remover</button>
+                        </div>
+                      ))}
+                      <div className="access-row add-access-row">
+                        <input
+                          value={accessDrafts[account.id] || ""}
+                          placeholder="NOVO USUARIO"
+                          onChange={(event) => setAccessDrafts((current) => ({ ...current, [account.id]: uppercaseInput(event.target.value) }))}
+                        />
+                        <button type="button" className="reset-password" onClick={() => addAccess(account)}>Adicionar</button>
+                      </div>
+                    </div>
                   </td>
                 </tr>
               ))}
-              {!schools.length && (
+              {!filteredSchools.length && (
                 <tr>
-                  <td colSpan={5}>Nenhuma escola cadastrada ainda.</td>
+                  <td colSpan={5}>Nenhuma escola encontrada.</td>
                 </tr>
               )}
             </tbody>
           </table>
         </section>
+        </>
+        )}
       </section>
     </main>
   );
@@ -2821,7 +4102,6 @@ function NewHistoryScreen({
       <section className="settings-screen">
         <div className="panel-heading">
           <h2>Criar historico</h2>
-          <p>Antes de criar o historico, cadastre uma turma e ano letivo.</p>
         </div>
         <button className="primary" onClick={openClasses}>Criar turma</button>
       </section>
@@ -2846,7 +4126,6 @@ function NewHistoryScreen({
     <section className="settings-screen">
       <div className="panel-heading">
         <h2>Criar historico</h2>
-        <p>Escolha a turma e depois escolha se vai digitar ou criar por imagem.</p>
       </div>
       <label className="wide">
         <span>Turma / ano letivo</span>
@@ -2858,11 +4137,11 @@ function NewHistoryScreen({
       <div className="create-mode-grid">
         <button className="create-mode-card" disabled={!selectedFolder} onClick={createByTyping}>
           <strong>Digitar historico</strong>
-          <span>Abre o formulario normal para preencher aluno, notas, carga horaria, estudos e certificado.</span>
+          <span>Preenchimento manual</span>
         </button>
         <button className="create-mode-card" disabled={!selectedFolder} onClick={() => setMode("image")}>
           <strong>Criar por imagem</strong>
-          <span>Anexa frente e verso do historico e cria o registro dentro da turma escolhida.</span>
+          <span>Digitalizar historico</span>
         </button>
       </div>
     </section>
@@ -3076,13 +4355,28 @@ function PhotoHistoryImport({
   };
 
   const updateDraftNote = (componentId: string, year: number, value: string) => {
+    if (!isAllowedNoteTyping(value)) return;
+    const note = normalizeNoteInput(value);
     setDraft((current) => current ? {
       ...current,
       notas: {
         ...current.notas,
         [componentId]: {
           ...(current.notas[componentId] ?? {}),
-          [year]: uppercaseInput(value),
+          [year]: note,
+        },
+      },
+    } : current);
+  };
+  const finishDraftNote = (componentId: string, year: number, value: string) => {
+    const note = formatNoteValue(value);
+    setDraft((current) => current ? {
+      ...current,
+      notas: {
+        ...current.notas,
+        [componentId]: {
+          ...(current.notas[componentId] ?? {}),
+          [year]: note,
         },
       },
     } : current);
@@ -3155,8 +4449,16 @@ function PhotoHistoryImport({
             <Field label="Nome completo" value={draft.aluno.nome} onChange={(value) => updateDraftStudent({ nome: value })} wide />
             <Field label="Data de nascimento" type="date" value={draft.aluno.nascimento} onChange={(value) => updateDraftStudent({ nascimento: value })} />
             <Field label="Nacionalidade" value={draft.aluno.nacionalidade} onChange={(value) => updateDraftStudent({ nacionalidade: value })} />
-            <Field label="Naturalidade - cidade" value={draft.aluno.naturalidadeCidade} onChange={(value) => updateDraftStudent({ naturalidadeCidade: value })} />
-            <Field label="Naturalidade - estado" value={draft.aluno.naturalidadeEstado} onChange={(value) => updateDraftStudent({ naturalidadeEstado: value })} />
+            <LocationFields
+              cityLabel="Naturalidade - cidade"
+              stateLabel="Naturalidade - estado"
+              municipio={draft.aluno.naturalidadeCidade}
+              estado={draft.aluno.naturalidadeEstado}
+              onChange={(patch) => updateDraftStudent({
+                naturalidadeCidade: patch.municipio ?? draft.aluno.naturalidadeCidade,
+                naturalidadeEstado: patch.estado ?? draft.aluno.naturalidadeEstado,
+              })}
+            />
             <Field label="Identidade" value={draft.aluno.identidade} onChange={(value) => updateDraftStudent({ identidade: value })} />
             <Field label="Nome do pai" value={draft.aluno.pai} onChange={(value) => updateDraftStudent({ pai: value })} />
             <Field label="Nome da mae" value={draft.aluno.mae} onChange={(value) => updateDraftStudent({ mae: value })} />
@@ -3180,7 +4482,7 @@ function PhotoHistoryImport({
                   <tr key={component.id}>
                     <td>{component.nome}</td>
                     {years.map((year) => (
-                      <td key={year}><input value={draft.notas[component.id]?.[year] ?? ""} onChange={(event) => updateDraftNote(component.id, year, event.target.value)} /></td>
+                      <td key={year}><input inputMode="decimal" title="Use nota de 0 a 10,0" value={draft.notas[component.id]?.[year] ?? ""} onChange={(event) => updateDraftNote(component.id, year, event.target.value)} onBlur={(event) => finishDraftNote(component.id, year, event.target.value)} /></td>
                     ))}
                   </tr>
                 ))}
@@ -3463,30 +4765,21 @@ function TransfersScreen({
   );
 }
 
-function SchoolSettings({ school, updateSchool, onSave }: { school: School; updateSchool: (patch: Partial<School>) => void; onSave: () => void }) {
-  const uploadSchoolImage = async (key: "logo" | "carimboEscola" | "assinaturaDiretor" | "assinaturaSecretario", file?: File) => {
+function SchoolSettings({ school, schoolDirectory, updateSchool, onSave }: { school: School; schoolDirectory: SchoolDirectoryItem[]; updateSchool: (patch: Partial<School>) => void; onSave: () => void }) {
+  const uploadSchoolImage = async (key: "logoSistema" | "logo" | "carimboEscola" | "assinaturaDiretor" | "assinaturaSecretario", file?: File) => {
     const image = await imageFileToTransparentPng(file);
     if (!image) return;
     updateSchool({ [key]: image });
   };
-  const makeSchoolImageTransparent = async (key: "logo" | "carimboEscola" | "assinaturaDiretor" | "assinaturaSecretario", value: string) => {
+  const makeSchoolImageTransparent = async (key: "logoSistema" | "logo" | "carimboEscola" | "assinaturaDiretor" | "assinaturaSecretario", value: string) => {
     updateSchool({ [key]: await removeLightBackground(value) });
   };
   const fields: Array<[keyof School, string]> = [
-    ["estado", "Estado"],
-    ["municipio", "Municipio"],
     ["nome", "Nome do estabelecimento"],
     ["mantenedora", "Entidade mantenedora"],
-    ["codigo", "Codigo INEP / Censo"],
-    ["credenciamento", "Credenciamento"],
-    ["autorizacao", "Autorizacao"],
-    ["reconhecimento", "Reconhecimento"],
+    ["codigo", "Codigo INEP"],
     ["parecer", "Parecer"],
     ["validade", "Validade"],
-    ["diretor", "Nome do diretor"],
-    ["registroDiretor", "Registro do diretor"],
-    ["secretario", "Nome do secretario escolar"],
-    ["registroSecretario", "Registro do secretario"],
   ];
   return (
     <section className="settings-screen">
@@ -3495,14 +4788,42 @@ function SchoolSettings({ school, updateSchool, onSave }: { school: School; upda
         <p>Esses dados preenchem automaticamente o cabecalho, dados legais, local e assinaturas.</p>
       </div>
       <div className="settings-grid">
+        <LocationFields
+          estado={school.estado}
+          municipio={school.municipio}
+          onChange={(patch) => updateSchool(patch)}
+        />
         {fields.map(([key, label]) => (
           <label key={key} className={key === "nome" || key === "mantenedora" ? "wide" : ""}>
             <span>{label}</span>
-            <input value={school[key]} onChange={(event) => updateSchool({ [key]: uppercaseInput(event.target.value) })} />
+            {key === "nome" ? (
+              <SchoolNameInput
+                value={school.nome}
+                onChange={(value) => updateSchool({ nome: value })}
+                municipio={school.municipio}
+                estado={school.estado}
+                schoolDirectory={schoolDirectory}
+                placeholder="Nome do estabelecimento"
+              />
+            ) : (
+              <input value={school[key]} onChange={(event) => updateSchool({ [key]: uppercaseInput(event.target.value) })} />
+            )}
           </label>
         ))}
         <label className="wide signature-upload">
-          <span>Brasao/logomarca</span>
+          <span>Logomarca do sistema</span>
+          <input value={school.logoSistema} onChange={(event) => updateSchool({ logoSistema: event.target.value })} placeholder="URL da imagem ou deixe vazio" />
+          <input type="file" accept="image/*" onChange={(event) => uploadSchoolImage("logoSistema", event.target.files?.[0])} />
+          {school.logoSistema && (
+            <div>
+              <img src={school.logoSistema} alt="" />
+              <button type="button" onClick={() => makeSchoolImageTransparent("logoSistema", school.logoSistema)}>Remover fundo</button>
+              <button type="button" onClick={() => updateSchool({ logoSistema: "" })}>Remover</button>
+            </div>
+          )}
+        </label>
+        <label className="wide signature-upload">
+          <span>Brasao/logomarca do historico</span>
           <input value={school.logo} onChange={(event) => updateSchool({ logo: event.target.value })} placeholder="URL da imagem ou deixe vazio" />
           <input type="file" accept="image/*" onChange={(event) => uploadSchoolImage("logo", event.target.files?.[0])} />
           {school.logo && (
@@ -3573,6 +4894,7 @@ function StepForm({
   step,
   updateActive,
   updateSchool,
+  schoolDirectory,
   setStep,
   finishHistory,
 }: {
@@ -3581,6 +4903,7 @@ function StepForm({
   step: number;
   updateActive: (updater: (record: HistoryRecord) => HistoryRecord) => void;
   updateSchool: (patch: Partial<School>) => void;
+  schoolDirectory: SchoolDirectoryItem[];
   setStep: (step: number) => void;
   finishHistory: (id: string, generatePdf?: boolean) => Promise<void>;
 }) {
@@ -3596,8 +4919,16 @@ function StepForm({
             <Field label="Nome completo" value={record.aluno.nome} onChange={(value) => updateStudent({ nome: value })} wide />
             <Field label="Data de nascimento" type="date" value={record.aluno.nascimento} onChange={(value) => updateStudent({ nascimento: value })} />
             <Field label="Nacionalidade" value={record.aluno.nacionalidade} onChange={(value) => updateStudent({ nacionalidade: value })} />
-            <Field label="Naturalidade - cidade" value={record.aluno.naturalidadeCidade} onChange={(value) => updateStudent({ naturalidadeCidade: value })} />
-            <Field label="Naturalidade - estado" value={record.aluno.naturalidadeEstado} onChange={(value) => updateStudent({ naturalidadeEstado: value })} />
+            <LocationFields
+              cityLabel="Naturalidade - cidade"
+              stateLabel="Naturalidade - estado"
+              municipio={record.aluno.naturalidadeCidade}
+              estado={record.aluno.naturalidadeEstado}
+              onChange={(patch) => updateStudent({
+                naturalidadeCidade: patch.municipio ?? record.aluno.naturalidadeCidade,
+                naturalidadeEstado: patch.estado ?? record.aluno.naturalidadeEstado,
+              })}
+            />
             <Field label="Identidade" value={record.aluno.identidade} onChange={(value) => updateStudent({ identidade: value })} />
             <label className="checkbox-line wide">
               <input
@@ -3616,15 +4947,7 @@ function StepForm({
       {step === 1 && (
         <>
           <h2>Dados do Ensino Fundamental</h2>
-          <div className="inline-actions">
-            <button onClick={() => updateActive((item) => ({ ...item, dadosLegais: { credenciamento: school.credenciamento, autorizacao: school.autorizacao, reconhecimento: school.reconhecimento, parecer: school.parecer, validade: school.validade } }))}>
-              Usar dados da escola
-            </button>
-          </div>
           <div className="form-grid">
-            <Field label="Credenciamento" value={record.dadosLegais.credenciamento} onChange={(value) => updateLegal({ credenciamento: value })} wide />
-            <Field label="Autorizacao" value={record.dadosLegais.autorizacao} onChange={(value) => updateLegal({ autorizacao: value })} />
-            <Field label="Reconhecimento" value={record.dadosLegais.reconhecimento} onChange={(value) => updateLegal({ reconhecimento: value })} />
             <Field label="Parecer" value={record.dadosLegais.parecer} onChange={(value) => updateLegal({ parecer: value })} />
             <Field label="Validade" value={record.dadosLegais.validade} onChange={(value) => updateLegal({ validade: value })} />
           </div>
@@ -3633,7 +4956,7 @@ function StepForm({
 
       {step === 2 && <NotesForm record={record} school={school} updateActive={updateActive} />}
       {step === 3 && <WorkloadForm record={record} updateActive={updateActive} />}
-      {step === 4 && <StudiesForm record={record} updateActive={updateActive} />}
+      {step === 4 && <StudiesForm record={record} schoolDirectory={schoolDirectory} updateActive={updateActive} />}
       {step === 5 && <CertificateForm record={record} school={school} updateActive={updateActive} updateSchool={updateSchool} />}
       {step === 6 && (
         <Conference
@@ -3660,6 +4983,174 @@ function Field({ label, value, onChange, type = "text", wide = false, disabled =
   );
 }
 
+function SchoolNameInput({
+  value,
+  onChange,
+  municipio,
+  estado,
+  schoolDirectory,
+  placeholder = "Nome da escola",
+  disabled = false,
+  compact = false,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  municipio: string;
+  estado: string;
+  schoolDirectory: SchoolDirectoryItem[];
+  placeholder?: string;
+  disabled?: boolean;
+  compact?: boolean;
+}) {
+  const { schools, loading } = useSchoolDirectory(municipio, estado, schoolDirectory);
+  const listId = useId();
+
+  if (disabled) {
+    return <input disabled value="-" aria-label={placeholder} />;
+  }
+
+  return (
+    <span className={compact ? "school-name-input compact" : "school-name-input"}>
+      <input
+        list={listId}
+        title={value}
+        value={value}
+        onChange={(event) => onChange(uppercaseInput(event.target.value))}
+        placeholder={loading ? "Buscando escolas..." : placeholder}
+        aria-label={placeholder}
+      />
+      <datalist id={listId}>
+        {schools.map((item) => (
+          <option key={`${item.estado}-${item.municipio}-${item.codigo || item.nome}`} value={item.nome}>
+            {[item.codigo, item.rede].filter(Boolean).join(" - ")}
+          </option>
+        ))}
+      </datalist>
+    </span>
+  );
+}
+
+function LocationFields({
+  municipio,
+  estado,
+  onChange,
+  cityLabel = "Municipio",
+  stateLabel = "Estado",
+}: {
+  municipio: string;
+  estado: string;
+  onChange: (patch: { municipio?: string; estado?: string }) => void;
+  cityLabel?: string;
+  stateLabel?: string;
+}) {
+  const { states, cities, stateCode, loadingCities } = useBrazilLocations(estado);
+  const selectedState = stateCode.length === 2 ? stateCode : "";
+  const selectedCity = uppercaseInput(municipio);
+  const cityExists = cities.some((city) => uppercaseInput(city.nome) === selectedCity);
+
+  return (
+    <>
+      <label>
+        <span>{stateLabel}</span>
+        <select
+          value={selectedState}
+          onChange={(event) => onChange({ estado: event.target.value, municipio: "" })}
+        >
+          <option value="">{states.length ? "Selecione" : "Carregando..."}</option>
+          {states.map((state) => (
+            <option key={state.id} value={state.sigla}>{state.sigla} - {uppercaseInput(state.nome)}</option>
+          ))}
+        </select>
+      </label>
+      <label>
+        <span>{cityLabel}</span>
+        {selectedState && !loadingCities && !cities.length ? (
+          <input value={selectedCity} onChange={(event) => onChange({ municipio: uppercaseInput(event.target.value) })} />
+        ) : (
+          <select
+            value={cityExists ? selectedCity : ""}
+            disabled={!selectedState || loadingCities}
+            onChange={(event) => onChange({ municipio: event.target.value })}
+          >
+            <option value="">{loadingCities ? "Carregando..." : selectedState ? "Selecione" : "Escolha o estado"}</option>
+            {!cityExists && selectedCity && <option value={selectedCity}>{selectedCity}</option>}
+            {cities.map((city) => {
+              const name = uppercaseInput(city.nome);
+              return <option key={city.id} value={name}>{name}</option>;
+            })}
+          </select>
+        )}
+      </label>
+    </>
+  );
+}
+
+function StudyLocationFields({
+  cidade,
+  estado,
+  disabled,
+  onChange,
+}: {
+  cidade: string;
+  estado: string;
+  disabled: boolean;
+  onChange: (patch: Partial<Pick<StudyRow, "cidade" | "estado">>) => void;
+}) {
+  const { states, cities, stateCode, loadingCities } = useBrazilLocations(estado);
+  const selectedState = stateCode.length === 2 ? stateCode : "";
+  const selectedCity = uppercaseInput(cidade);
+  const cityExists = cities.some((city) => uppercaseInput(city.nome) === selectedCity);
+
+  if (disabled) {
+    return (
+      <>
+        <input disabled value="-" aria-label="Cidade" />
+        <input disabled value="-" aria-label="UF" />
+      </>
+    );
+  }
+
+  return (
+    <>
+      {selectedState && !loadingCities && !cities.length ? (
+        <input
+          title={selectedCity}
+          value={selectedCity}
+          onChange={(event) => onChange({ cidade: uppercaseInput(event.target.value) })}
+          placeholder="Cidade"
+          aria-label="Cidade"
+        />
+      ) : (
+        <select
+          title={selectedCity}
+          value={selectedCity}
+          disabled={!selectedState || loadingCities}
+          onChange={(event) => onChange({ cidade: event.target.value })}
+          aria-label="Cidade"
+        >
+          <option value="">{loadingCities ? "Carregando..." : selectedState ? "Cidade" : "Escolha a UF"}</option>
+          {!cityExists && selectedCity && <option value={selectedCity}>{selectedCity}</option>}
+          {cities.map((city) => {
+            const name = uppercaseInput(city.nome);
+            return <option key={city.id} value={name}>{name}</option>;
+          })}
+        </select>
+      )}
+      <select
+        title={selectedState || upper(estado)}
+        value={selectedState}
+        onChange={(event) => onChange({ estado: event.target.value, cidade: "" })}
+        aria-label="UF"
+      >
+        <option value="">UF</option>
+        {states.map((state) => (
+          <option key={state.id} value={state.sigla}>{state.sigla}</option>
+        ))}
+      </select>
+    </>
+  );
+}
+
 function NotesForm({ record, school, updateActive }: { record: HistoryRecord; school: School; updateActive: (updater: (record: HistoryRecord) => HistoryRecord) => void }) {
   const tableRef = useRef<HTMLDivElement>(null);
   const [newComponent, setNewComponent] = useState({ nome: "", area: "Parte Diversificada" as Area, inicio: 1, fim: 9, avaliativo: true });
@@ -3679,6 +5170,21 @@ function NotesForm({ record, school, updateActive }: { record: HistoryRecord; sc
         ...item.notasNegritoAnos,
         [year]: !item.notasNegritoAnos[year],
       },
+    }));
+  };
+  const updateNote = (componentId: string, year: number, value: string) => {
+    if (!isAllowedNoteTyping(value)) return;
+    const note = normalizeNoteInput(value);
+    updateActive((item) => ({
+      ...item,
+      notas: { ...item.notas, [componentId]: { ...(item.notas[componentId] ?? {}), [year]: note } },
+    }));
+  };
+  const finishNote = (componentId: string, year: number, value: string) => {
+    const note = formatNoteValue(value);
+    updateActive((item) => ({
+      ...item,
+      notas: { ...item.notas, [componentId]: { ...(item.notas[componentId] ?? {}), [year]: note } },
     }));
   };
 
@@ -3723,11 +5229,11 @@ function NotesForm({ record, school, updateActive }: { record: HistoryRecord; sc
                         data-row={rowIndex}
                         data-col={colIndex}
                         disabled={disabled}
+                        inputMode="decimal"
+                        title="Use nota de 0 a 10,0"
                         value={disabled ? "-" : record.notas[component.id]?.[year] ?? ""}
-                        onChange={(event) => updateActive((item) => ({
-                          ...item,
-                          notas: { ...item.notas, [component.id]: { ...(item.notas[component.id] ?? {}), [year]: uppercaseInput(event.target.value) } },
-                        }))}
+                        onChange={(event) => updateNote(component.id, year, event.target.value)}
+                        onBlur={(event) => finishNote(component.id, year, event.target.value)}
                         onKeyDown={(event) => {
                           if (event.key === "Enter") moveFocus(event.currentTarget, 0, 1);
                           if (event.key === "ArrowRight") moveFocus(event.currentTarget, 0, 1);
@@ -3861,19 +5367,19 @@ function WorkloadForm({ record, updateActive }: { record: HistoryRecord; updateA
   );
 }
 
-function StudiesForm({ record, updateActive }: { record: HistoryRecord; updateActive: (updater: (record: HistoryRecord) => HistoryRecord) => void }) {
+function StudiesForm({ record, schoolDirectory, updateActive }: { record: HistoryRecord; schoolDirectory: SchoolDirectoryItem[]; updateActive: (updater: (record: HistoryRecord) => HistoryRecord) => void }) {
   const updateStudy = (index: number, patch: Partial<StudyRow>) => {
     updateActive((item) => ({ ...item, estudos: item.estudos.map((row, rowIndex) => rowIndex === index ? { ...row, ...patch } : row) }));
   };
   const applyNext = (index: number) => {
     updateActive((item) => {
       const source = item.estudos[index];
+      const nextIndex = index + 1;
       return {
         ...item,
         estudos: item.estudos.map((row, rowIndex) => {
-          if (rowIndex <= index) return row;
-          const alreadyFilled = [row.escola, row.cidade, row.estado].some((value) => value.trim() && value !== "-");
-          return alreadyFilled ? row : { ...row, escola: source.escola, cidade: source.cidade, estado: source.estado };
+          if (rowIndex !== nextIndex) return row;
+          return { ...row, ativo: true, escola: source.escola, cidade: source.cidade, estado: source.estado };
         }),
       };
     });
@@ -3885,15 +5391,29 @@ function StudiesForm({ record, updateActive }: { record: HistoryRecord; updateAc
         {record.estudos.map((study, index) => (
           <div className="study-row" key={study.serie}>
             <label className="study-active">
-              <input type="checkbox" checked={study.ativo} onChange={(event) => updateStudy(index, { ativo: event.target.checked })} />
-              <span>Tem</span>
+              <input type="checkbox" aria-label={`${study.serie} possui estudos realizados`} checked={study.ativo} onChange={(event) => updateStudy(index, { ativo: event.target.checked })} />
             </label>
             <strong>{study.serie}</strong>
             <input title={study.ano} disabled={!study.ativo} value={study.ativo ? study.ano : "-"} onChange={(event) => updateStudy(index, { ano: uppercaseInput(event.target.value) })} placeholder="Ano" />
-            <input title={study.escola} disabled={!study.ativo} value={study.ativo ? study.escola : "-"} onChange={(event) => updateStudy(index, { escola: uppercaseInput(event.target.value) })} placeholder="Estabelecimento" />
-            <input title={study.cidade} disabled={!study.ativo} value={study.ativo ? study.cidade : "-"} onChange={(event) => updateStudy(index, { cidade: uppercaseInput(event.target.value) })} placeholder="Cidade" />
-            <input title={study.estado} disabled={!study.ativo} value={study.ativo ? study.estado : "-"} onChange={(event) => updateStudy(index, { estado: uppercaseInput(event.target.value) })} placeholder="UF" />
-            <button disabled={!study.ativo} onClick={() => applyNext(index)}>Usar nos proximos</button>
+            <SchoolNameInput
+              value={study.ativo ? study.escola : "-"}
+              disabled={!study.ativo}
+              onChange={(value) => updateStudy(index, { escola: value })}
+              municipio={study.cidade}
+              estado={study.estado}
+              schoolDirectory={schoolDirectory}
+              placeholder="Estabelecimento"
+              compact
+            />
+            <StudyLocationFields
+              cidade={study.cidade}
+              estado={study.estado}
+              disabled={!study.ativo}
+              onChange={(patch) => updateStudy(index, patch)}
+            />
+            {index < record.estudos.length - 1 && (
+              <button type="button" disabled={!study.ativo} onClick={() => applyNext(index)}>Usar no proximo</button>
+            )}
           </div>
         ))}
       </div>
@@ -4002,8 +5522,11 @@ function CertificateForm({
       </div>
       <h3>Local e data</h3>
       <div className="form-grid">
-        <Field label="Municipio" value={record.localData.municipio} onChange={(value) => updateActive((item) => ({ ...item, localData: { ...item.localData, municipio: value } }))} />
-        <Field label="Estado" value={record.localData.estado} onChange={(value) => updateActive((item) => ({ ...item, localData: { ...item.localData, estado: value } }))} />
+        <LocationFields
+          estado={record.localData.estado}
+          municipio={record.localData.municipio}
+          onChange={(patch) => updateActive((item) => ({ ...item, localData: { ...item.localData, ...patch } }))}
+        />
         <Field label="Data de emissao" type="date" value={record.localData.data} onChange={(value) => updateActive((item) => ({ ...item, localData: { ...item.localData, data: value } }))} />
       </div>
     </>
@@ -4130,10 +5653,11 @@ function Watermark() {
 }
 
 function DocumentHeader({ school, useSchoolStamp }: { school: School; useSchoolStamp: boolean }) {
+  const historyLogo = school.logo || defaultSchool.logo;
   return (
     <div className="current-doc-header">
       <div className="header-logo-box">
-        <img src={school.logo} alt="" />
+        <img src={historyLogo} alt="" />
       </div>
       <div className="school-title-box">
         <h2>ESTADO DO CEARÁ</h2>
@@ -4200,10 +5724,11 @@ function DocumentPageOne({ record, school }: { record: HistoryRecord; school: Sc
       </section>
 
       <div className="legal-strip">
-        <span>ENSINO FUNDAMENTAL</span>
-        <span>CREDENCIAMENTO/<br />AUTORIZAÇÃO</span>
-        <span>CRE DENCIAMENTO/<br />RECONHECIMENTO</span>
-        <span>PARECER: {upper(record.dadosLegais.parecer || school.parecer)}<br />VALIDADE: {upper(school.validade)}</span>
+        <span className="legal-stage">ENSINO FUNDAMENTAL</span>
+        <span className="legal-authorization">CREDENCIAMENTO/<br />AUTORIZAÇÃO</span>
+        <span className="legal-check" aria-hidden="true" />
+        <span className="legal-recognition">CRE DENCIAMENTO/<br />RECONHECIMENTO</span>
+        <span className="legal-validity">PARECER: {upper(record.dadosLegais.parecer || school.parecer)}<br />VALIDADE: {upper(record.dadosLegais.validade || school.validade)}</span>
       </div>
 
       <table className="doc-table current-matrix">
@@ -4361,21 +5886,17 @@ function DocumentPageTwo({ record, school }: { record: HistoryRecord; school: Sc
         <p className="local-label">LOCAL E DATA</p>
         <div className={showDirectorStamp ? "signature-line has-stamp" : "signature-line"}>
           {showDirectorStamp && <img className="signature-stamp" src={school.assinaturaDiretor} alt="" />}
-          {!showDirectorStamp && <span>{school.registroDiretor}</span>}
           {!showDirectorStamp && <small>DIRETOR (A) - Reg. Nº</small>}
         </div>
         <div className={showSecretaryStamp ? "signature-line has-stamp" : "signature-line"}>
           {showSecretaryStamp && <img className="signature-stamp" src={school.assinaturaSecretario} alt="" />}
-          {!showSecretaryStamp && <span>{school.registroSecretario}</span>}
           {!showSecretaryStamp && <small>SECRETÁRIO (A) – REG. Nº</small>}
         </div>
       </section>
 
       <section className="current-certificate">
         <h2>CERTIFICADO</h2>
-        <p>
-          Certificamos que: <strong className="cert-fill cert-name">{certificateName}</strong>
-        </p>
+        <p className="cert-intro">Certificamos que: <strong className="cert-fill cert-name">{certificateName}</strong></p>
         <p>
           Concluiu o (a) <strong className="cert-fill cert-stage">{certificateStage}</strong> do Ensino Fundamental, no ano de <strong className="cert-fill cert-year">{certificateYear}</strong>, de acordo com a lei vigente, tendo obtidos resultados constante neste histórico escolar, dando-lhe o direito de prosseguimento de estudos no <strong className="cert-fill cert-next">{certificateNext}</strong>.
         </p>

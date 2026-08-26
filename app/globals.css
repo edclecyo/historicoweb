@@ -95,6 +95,15 @@ textarea:focus {
   box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.14);
 }
 
+.school-name-input {
+  display: block;
+  width: 100%;
+}
+
+.school-name-input.compact {
+  min-width: 0;
+}
+
 textarea {
   min-height: 88px;
   resize: vertical;
@@ -240,6 +249,17 @@ label span {
   box-shadow: 0 10px 24px rgba(15, 174, 157, 0.28);
   font-size: 15px;
   font-weight: 800;
+}
+
+.brand-logo {
+  width: 62px;
+  height: 62px;
+  box-sizing: border-box;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 4px;
+  object-fit: contain;
+  object-position: center;
 }
 
 .brand strong,
@@ -413,12 +433,15 @@ label span {
 }
 
 .school-chip img {
-  width: 30px;
-  height: 30px;
+  width: 42px;
+  height: 42px;
+  box-sizing: border-box;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: #ffffff;
+  padding: 3px;
   object-fit: contain;
+  object-position: center;
 }
 
 .actions,
@@ -489,6 +512,33 @@ label span {
   color: var(--primary-dark);
   font-size: 12px;
   font-weight: 800;
+}
+
+.reset-password.danger {
+  color: #b42318;
+}
+
+.access-list {
+  display: grid;
+  min-width: 340px;
+  gap: 8px;
+}
+
+.access-row {
+  display: grid;
+  grid-template-columns: minmax(130px, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.access-row input {
+  min-width: 0;
+}
+
+.add-access-row {
+  grid-template-columns: minmax(130px, 1fr) auto;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
 }
 
 .first-access-card {
@@ -595,6 +645,129 @@ label span {
   margin-top: 16px;
 }
 
+.admin-search {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 12px;
+}
+
+.admin-search span {
+  color: #475467;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.admin-search input {
+  min-height: 42px;
+}
+
+.overview-screen {
+  display: grid;
+  gap: 16px;
+}
+
+.overview-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+}
+
+.overview-cards article {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: #ffffff;
+  padding: 16px;
+  box-shadow: 0 10px 26px rgba(16, 24, 40, 0.06);
+}
+
+.overview-cards span {
+  color: #475467;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.overview-cards strong {
+  color: #0f172a;
+  font-size: 28px;
+}
+
+.admin-security {
+  margin-bottom: 16px;
+}
+
+.admin-security button {
+  align-self: end;
+  min-height: 44px;
+}
+
+.restricted-table {
+  margin-top: 14px;
+}
+
+.restricted-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.status-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: #344054;
+  font-weight: 800;
+}
+
+.status-toggle input {
+  width: auto;
+}
+
+.school-status-toggle {
+  gap: 10px;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border-radius: 999px;
+  padding: 5px 9px;
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.status-pill i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.status-pill.active {
+  background: #dcfae6;
+  color: #067647;
+}
+
+.status-pill.active i {
+  background: #12b76a;
+}
+
+.status-pill.inactive {
+  background: #fee4e2;
+  color: #b42318;
+}
+
+.status-pill.inactive i {
+  background: #f04438;
+}
+
 .school-kind {
   display: grid;
   align-content: start;
@@ -618,6 +791,19 @@ label span {
 
 .school-kind input {
   width: auto;
+}
+
+.login-school-kind {
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 10px;
+}
+
+.login-school-kind > span {
+  grid-column: 1 / -1;
 }
 
 .wide {
@@ -1070,7 +1256,7 @@ label span {
 
 .study-row {
   display: grid;
-  grid-template-columns: 54px 62px 74px minmax(0, 1.5fr) minmax(0, 1fr) 58px;
+  grid-template-columns: 28px 62px 74px minmax(0, 1.5fr) minmax(0, 1fr) 58px;
   gap: 8px;
   align-items: center;
   border: 1px solid #e4e7ec;
@@ -1080,9 +1266,9 @@ label span {
 }
 
 .study-active {
-  display: flex;
+  display: grid;
   align-items: center;
-  gap: 5px;
+  justify-items: center;
   margin: 0;
   color: #475467;
   font-size: 12px;
@@ -1093,15 +1279,12 @@ label span {
   width: auto;
 }
 
-.study-active span {
-  margin: 0;
-}
-
 .study-row strong {
   font-size: 12px;
 }
 
-.study-row input {
+.study-row input,
+.study-row select {
   min-width: 0;
   width: 100%;
   text-align: center;
@@ -1262,7 +1445,7 @@ label span {
 .current-model::after {
   content: "";
   position: absolute;
-  inset: 8px;
+  inset: 32px;
   z-index: 5;
   border: 1px solid #000000;
   pointer-events: none;
@@ -1300,6 +1483,7 @@ label span {
 .school-title-box {
   display: grid;
   align-content: center;
+  padding: 3px 0;
   text-align: center;
 }
 
@@ -1307,8 +1491,6 @@ label span {
 .school-title-box p,
 .school-title-box strong {
   margin: 0;
-  min-height: 20px;
-  padding: 1px 4px;
   line-height: 1.05;
 }
 
@@ -1317,13 +1499,29 @@ label span {
 }
 
 .school-title-box p {
+  display: flex;
+  min-height: 17px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
   font-size: 13px;
 }
 
-.school-title-box strong {
-  display: block;
+.school-title-box p::before,
+.school-title-box p::after {
+  content: "";
+  flex: 1;
   border-top: 1px solid #000000;
-  font-size: 14px;
+}
+
+.school-title-box strong {
+  display: grid;
+  min-height: 18px;
+  margin: 0 7px 2px;
+  place-items: center;
+  border: 1px solid #000000;
+  padding: 0 4px;
+  font-size: 13.5px;
 }
 
 .header-empty-box {
@@ -1365,8 +1563,8 @@ label span {
 }
 
 .student-full-name {
-  white-space: pre-wrap;
-  word-spacing: .22em;
+  white-space: normal;
+  word-spacing: normal;
 }
 
 .student-block {
@@ -1421,6 +1619,7 @@ label span {
   place-items: center;
   border: 0;
   font-size: 12px;
+  line-height: 1;
 }
 
 .student-block .boxed {
@@ -1507,13 +1706,78 @@ label span {
 }
 
 .legal-strip {
-  display: grid;
-  grid-template-columns: 1.1fr 0.8fr 0.9fr 0.8fr;
-  align-items: center;
-  min-height: 42px;
+  position: relative;
+  width: 720px;
+  height: 38px;
+  margin: 0;
   text-align: center;
-  font-size: 12px;
+  font-size: 14px;
   line-height: 1.05;
+}
+
+.legal-strip span {
+  position: absolute;
+  top: 0;
+  display: block;
+  font-weight: 400;
+}
+
+.legal-strip .legal-stage {
+  left: 0;
+  width: 214px;
+  text-align: left;
+}
+
+.legal-strip .legal-authorization {
+  left: 236px;
+  width: 116px;
+}
+
+.legal-strip .legal-check {
+  top: 1px;
+  left: 378px;
+  width: 13px;
+  height: 18px;
+  border: 1px solid #000000;
+  border-radius: 50%;
+  background: #ffffff;
+  color: #000000;
+  line-height: 1;
+  print-color-adjust: exact;
+  -webkit-print-color-adjust: exact;
+}
+
+.legal-strip .legal-check::before,
+.legal-strip .legal-check::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  left: 5px;
+  width: 1px;
+  height: 15px;
+  background: #000000 !important;
+  transform-origin: center;
+  print-color-adjust: exact;
+  -webkit-print-color-adjust: exact;
+}
+
+.legal-strip .legal-check::before {
+  transform: rotate(27deg);
+}
+
+.legal-strip .legal-check::after {
+  transform: rotate(-27deg);
+}
+
+.legal-strip .legal-recognition {
+  left: 392px;
+  width: 142px;
+}
+
+.legal-strip .legal-validity {
+  left: 553px;
+  width: 167px;
+  text-align: right;
 }
 
 .current-matrix {
@@ -1742,7 +2006,7 @@ label span {
   min-height: 1123px;
   overflow: hidden;
   padding: 32px 37px;
-  border: 1px solid #000000;
+  border: 0;
   box-shadow: 0 18px 50px rgba(16, 24, 40, 0.22);
   background: #ffffff;
   font-family: "Times New Roman", Times, serif;
@@ -1765,11 +2029,14 @@ label span {
   place-items: center;
   border: 1px solid #000000;
   border-right: 0;
+  padding: 3px;
 }
 
 .header-logo-box img {
-  width: 64px;
-  height: 86px;
+  width: 80px;
+  height: 128px;
+  max-width: 100%;
+  max-height: 100%;
   object-fit: contain;
 }
 
@@ -1964,10 +2231,11 @@ label span {
 
 .current-observations {
   min-height: 125px;
-  margin: 34px 28px 0;
+  margin: 31px 26px 0;
   border: 1px solid #000000;
   padding: 0;
   font-size: 11px;
+  text-align: left;
 }
 
 .current-observations h2 {
@@ -2057,15 +2325,16 @@ label span {
 
 .current-certificate {
   position: absolute;
-  right: 4px;
-  bottom: 16px;
-  left: 4px;
-  min-height: 102px;
+  right: 34px;
+  bottom: 32px;
+  left: 34px;
+  min-height: 94px;
   border: 1px solid #000000;
   margin: 0;
-  padding: 7px 10px;
+  padding: 7px 9px 5px;
   font-size: 10px;
   line-height: 1.08;
+  text-align: left;
 }
 
 .current-certificate h2 {
@@ -2077,14 +2346,20 @@ label span {
 
 .current-certificate p {
   margin: 0;
+  text-align: left;
 }
 
 .current-certificate strong {
   font-size: 11px;
 }
 
+.current-certificate .cert-intro {
+  line-height: 1.05;
+  white-space: nowrap;
+}
+
 .current-certificate .law-line {
-  margin-top: 4px;
+  margin-top: 3px;
   padding-right: 84px;
   text-align: right;
 }
@@ -2938,11 +3213,12 @@ label span {
 .vector-page .current-certificate {
   position: absolute;
   right: 34px;
-  bottom: 30px;
+  bottom: 32px;
   left: 34px;
-  min-height: 102px;
+  min-height: 94px;
   border: 1px solid #000000;
-  padding: 7px 10px;
+  padding: 7px 9px 5px;
+  text-align: left;
 }
 
 .vector-page .current-matrix .year-col {
@@ -3013,11 +3289,15 @@ label span {
   font-weight: 700;
   text-align: center;
   line-height: 1;
-  vertical-align: baseline;
+  vertical-align: text-bottom;
+  white-space: nowrap;
 }
 
 .vector-page .cert-name {
-  min-width: 265px;
+  width: auto;
+  max-width: none;
+  min-width: 0;
+  text-align: left;
 }
 
 .vector-page .cert-stage {
@@ -3167,7 +3447,7 @@ label span {
   }
 
   .print-only .document-page::after {
-    inset: 4mm;
+    inset: 8.5mm;
   }
 
   .print-only .family-box {

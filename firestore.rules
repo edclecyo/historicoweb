@@ -2,36 +2,8 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
-    function signedIn() { return request.auth != null; }
-    function isSuperAdmin() {
-      return signedIn() && request.auth.token.email == 'edclecyo12@gmail.com';
-    }
-    function profile() {
-      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
-    }
-    function isSchool(schoolId) {
-      return signedIn() && profile().role == 'school' && profile().schoolId == schoolId;
-    }
-
-    match /users/{userId} {
-      allow read: if isSuperAdmin() || (signedIn() && request.auth.uid == userId);
-      allow create, update: if isSuperAdmin();
-    }
-    match /usuarios/{userId}/historicoEscolar/{document} {
-      allow read, write: if signedIn() && request.auth.uid == userId;
-    }
-    match /schools/{schoolId} {
-      allow read: if isSuperAdmin() || isSchool(schoolId);
-      allow create, update: if isSuperAdmin() || isSchool(schoolId);
-      match /{document=**} {
-        allow read, write: if isSuperAdmin() || isSchool(schoolId);
-      }
-    }
-    match /transfers/{transferId} {
-      allow create: if signedIn() &&
-        (isSchool(request.resource.data.fromSchoolId) || isSchool(request.resource.data.toSchoolId));
-      allow read, update: if isSuperAdmin() || (signedIn() &&
-        (isSchool(resource.data.fromSchoolId) || isSchool(resource.data.toSchoolId)));
+    match /{document=**} {
+      allow read, write: if false;
     }
   }
 }

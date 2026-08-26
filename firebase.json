@@ -2,6 +2,36 @@
   "firestore": {
     "rules": "firestore.rules"
   },
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "ignore": [
+        "node_modules",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log"
+      ]
+    }
+  ],
+  "hosting": {
+    "site": "historicoweb",
+    "public": "dist/client",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "**",
+        "run": {
+          "serviceId": "historicoweb",
+          "region": "us-east4"
+        }
+      }
+    ]
+  },
   "apphosting": [
     {
       "backendId": "historicoweb",
@@ -9,6 +39,14 @@
       "ignore": [
         "node_modules",
         ".git",
+        ".codex-render",
+        ".codex-render-tmp",
+        ".tmp",
+        ".tmp-docx-render",
+        "functions",
+        "*.docx",
+        "~$*",
+        "~WRL*.tmp",
         "firebase-debug.log",
         "firebase-debug.*.log"
       ]
