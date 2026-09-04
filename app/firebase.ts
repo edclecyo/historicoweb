@@ -9,6 +9,7 @@ type CloudSession = {
   adminUserId?: string;
   schoolId?: string;
   accessId?: string;
+  accessLevel?: "principal" | "secundario";
   sessionToken: string;
 };
 
@@ -16,6 +17,31 @@ type CloudSessionResult<T> = {
   session: CloudSession;
   payload: T;
   histories?: unknown[];
+};
+
+export type CloudActivity = {
+  id: string;
+  tipo: string;
+  descricao: string;
+  usuario: string;
+  perfil: "owner" | "manager" | "school";
+  schoolId?: string;
+  schoolName?: string;
+  targetId?: string;
+  targetName?: string;
+  createdAt: number | string;
+};
+
+export type CloudActiveUser = {
+  id: string;
+  usuario: string;
+  perfil: "owner" | "manager" | "school";
+  schoolId?: string;
+  schoolName?: string;
+  currentView?: string;
+  actionLabel?: string;
+  targetName?: string;
+  lastSeen: number;
 };
 
 const firebaseConfig = {
@@ -34,6 +60,7 @@ export const firebaseEnabled = Boolean(
 const functionsRegion = "us-east4";
 const useBackendFunctions = import.meta.env.VITE_FIREBASE_USE_FUNCTIONS !== "false";
 const cloudSessionStorageKey = "historico-escolar-online:cloud-session:v1";
+const cloudRequestTimeoutMs = 8000;
 let cloudSessionToken: string | null = null;
 
 export function getCloudSessionToken() {
@@ -67,7 +94,7 @@ async function callBackend<T>(name: string, data?: Record<string, unknown>) {
     const sessionToken = getCloudSessionToken();
     const app = await getAuthenticatedFirebaseApp();
     const callable = httpsCallable(getFunctions(app, functionsRegion), name);
-    const result = await callable(sessionToken ? { ...(data ?? {}), sessionToken } : (data ?? {}));
+    const result = await withCloudTimeout(callable(sessionToken ? { ...(data ?? {}), sessionToken } : (data ?? {})));
     return { handled: true as const, data: result.data as T };
   } catch (error) {
     console.error("Nao foi possivel acessar o banco.", error);
@@ -81,8 +108,17 @@ async function callRequiredBackend<T>(name: string, data?: Record<string, unknow
   }
   const app = await getAuthenticatedFirebaseApp();
   const callable = httpsCallable(getFunctions(app, functionsRegion), name);
-  const result = await callable(data ?? {});
+  const result = await withCloudTimeout(callable(data ?? {}));
   return result.data as T;
+}
+
+function withCloudTimeout<T>(promise: Promise<T>) {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Tempo de resposta excedido.")), cloudRequestTimeoutMs);
+    promise
+      .then(resolve, reject)
+      .finally(() => clearTimeout(timer));
+  });
 }
 
 async function getCloudDocument() {
@@ -101,7 +137,7 @@ export async function loadCloudSetupStatus() {
   return callRequiredBackend<{ hasAdmin: boolean }>("getSetupStatus");
 }
 
-export async function createCloudOwner<T extends CloudState>(credentials: { usuario: string; senha: string }) {
+export async function createCloudOwner<T extends CloudState>(credentials: { usuario: string; senha: string; nome?: string; email?: string; cpf?: string }) {
   const result = await callRequiredBackend<CloudSessionResult<T>>("createOwner", credentials);
   setCloudSessionToken(result.session.sessionToken);
   return result;
@@ -131,6 +167,49 @@ export async function logoutCloudSession() {
   return true;
 }
 
+export async function changeCloudPassword(input: { currentPassword?: string; nextPassword: string; firstAccess?: boolean }) {
+  const sessionToken = getCloudSessionToken();
+  if (!sessionToken) return false;
+  const result = await callRequiredBackend<{ ok: boolean }>("changePassword", { ...input, sessionToken });
+  return result.ok;
+}
+
+export async function recoverCloudSchoolPassword(input: { usuario: string; email: string; cpf: string; tipo: string }) {
+  const result = await callRequiredBackend<{ ok: boolean }>("recoverSchoolPassword", input);
+  return result.ok;
+}
+
+export async function updateCloudProfile(input: { nome: string; email?: string; cpf?: string }) {
+  const sessionToken = getCloudSessionToken();
+  if (!sessionToken) return null;
+  const result = await callRequiredBackend<{ ok: boolean; nome: string }>("updateProfile", { ...input, sessionToken });
+  return result.ok ? result.nome : null;
+}
+
+export async function loadCloudActivity() {
+  const backend = await callBackend<{ activeUsers: CloudActiveUser[]; activities: CloudActivity[] }>("loadActivity");
+  if (backend.handled) return backend.data;
+  return { activeUsers: [], activities: [] };
+}
+
+export async function pingCloudActivity(input: { currentView?: string; actionLabel?: string; targetId?: string; targetName?: string; schoolName?: string }) {
+  if (useBackendFunctions && !getCloudSessionToken()) return false;
+  const backend = await callBackend<{ ok: boolean }>("pingActivity", input);
+  return backend.handled ? backend.data.ok : false;
+}
+
+export async function recordCloudActivity(input: { tipo: string; descricao: string; schoolId?: string; schoolName?: string; targetId?: string; targetName?: string }) {
+  if (useBackendFunctions && !getCloudSessionToken()) return false;
+  const backend = await callBackend<{ ok: boolean }>("recordActivity", { activity: input });
+  return backend.handled ? backend.data.ok : false;
+}
+
+export async function deleteCloudActivity(input: { id?: string; all?: boolean }) {
+  if (useBackendFunctions && !getCloudSessionToken()) return false;
+  const backend = await callBackend<{ ok: boolean }>("deleteActivity", input);
+  return backend.handled ? backend.data.ok : false;
+}
+
 export async function loadCloudState<T extends CloudState>() {
   if (useBackendFunctions && !getCloudSessionToken()) return null;
   const backend = await callBackend<{ payload: T | null }>("loadSystemState");
@@ -142,6 +221,7 @@ export async function loadCloudState<T extends CloudState>() {
 }
 
 export async function saveCloudState(data: CloudState) {
+  if (useBackendFunctions && !getCloudSessionToken()) return false;
   const backend = await callBackend<{ ok: boolean }>("saveSystemState", { payload: data });
   if (backend.handled) return backend.data.ok;
   if (useBackendFunctions) return false;
@@ -163,6 +243,7 @@ export async function loadCloudHistories<T>() {
 }
 
 export async function saveCloudHistory(id: string, data: CloudState) {
+  if (useBackendFunctions && !getCloudSessionToken()) return false;
   const backend = await callBackend<{ ok: boolean }>("saveHistory", { id, payload: data });
   if (backend.handled) return backend.data.ok;
   if (!firebaseEnabled || useBackendFunctions) return false;
@@ -172,6 +253,7 @@ export async function saveCloudHistory(id: string, data: CloudState) {
 }
 
 export async function saveCloudHistories<T extends { id: string }>(records: T[]) {
+  if (useBackendFunctions && !getCloudSessionToken()) return false;
   const backend = await callBackend<{ ok: boolean }>("saveHistories", { histories: records });
   if (backend.handled) return backend.data.ok;
   if (!firebaseEnabled || useBackendFunctions) return false;
@@ -187,6 +269,7 @@ export async function saveCloudHistories<T extends { id: string }>(records: T[])
 }
 
 export async function deleteCloudHistory(id: string) {
+  if (useBackendFunctions && !getCloudSessionToken()) return false;
   const backend = await callBackend<{ ok: boolean }>("deleteHistory", { id });
   if (backend.handled) return backend.data.ok;
   if (!firebaseEnabled || useBackendFunctions) return false;

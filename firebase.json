@@ -25,10 +25,7 @@
     "rewrites": [
       {
         "source": "**",
-        "run": {
-          "serviceId": "historicoweb",
-          "region": "us-east4"
-        }
+        "destination": "/index.html"
       }
     ]
   },

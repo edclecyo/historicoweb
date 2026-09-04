@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "vinext dev",
     "build": "vinext build",
+    "build:hosting": "vite build --config vite.hosting.config.ts",
     "start": "vinext start",
     "test": "npm run build && node --test tests/rendered-html.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
@@ -19,6 +20,8 @@
     "@vitejs/plugin-rsc": "0.5.26",
     "drizzle-orm": "0.45.2",
     "firebase": "^12.18.0",
+    "jsqr": "^1.4.0",
+    "qrcode": "^1.5.4",
     "react": "19.2.6",
     "react-dom": "19.2.6",
     "react-server-dom-webpack": "19.2.6",

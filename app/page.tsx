@@ -1,20 +1,29 @@
 "use client";
 
-import { Fragment, useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
+import { Fragment, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
 import {
+  changeCloudPassword,
   createCloudOwner,
   deleteCloudHistory,
   firebaseEnabled,
+  loadCloudActivity,
   loadCloudHistories,
   loadCloudSetupStatus,
   loadCloudState,
+  deleteCloudActivity,
   loginCloudAdmin,
   loginCloudSchool,
   logoutCloudSession,
+  pingCloudActivity,
+  recordCloudActivity,
   saveCloudHistories,
   saveCloudHistory,
   saveCloudState,
   setCloudSessionToken,
+  updateCloudProfile,
+  recoverCloudSchoolPassword,
+  type CloudActiveUser,
+  type CloudActivity,
 } from "./firebase";
 
 type Area =
@@ -45,6 +54,7 @@ type School = {
   validade: string;
   logoSistema: string;
   logo: string;
+  marcaDagua: string;
   carimboEscola: string;
   diretor: string;
   registroDiretor: string;
@@ -54,7 +64,25 @@ type School = {
   assinaturaSecretario: string;
 };
 
-type SchoolKind = "municipal" | "estadual";
+type SchoolImageKey = "logoSistema" | "logo" | "marcaDagua" | "carimboEscola" | "assinaturaDiretor" | "assinaturaSecretario";
+
+const schoolImageKeys: SchoolImageKey[] = [
+  "logoSistema",
+  "logo",
+  "marcaDagua",
+  "carimboEscola",
+  "assinaturaDiretor",
+  "assinaturaSecretario",
+];
+
+type SchoolKind = "municipal" | "estadual" | "privada";
+type SchoolAccessLevel = "principal" | "secundario";
+
+const schoolKindOptions: Array<{ value: SchoolKind; label: string }> = [
+  { value: "municipal", label: "Municipal" },
+  { value: "estadual", label: "Estadual" },
+  { value: "privada", label: "Privada" },
+];
 
 type IbgeState = {
   id: number;
@@ -78,7 +106,10 @@ type SchoolDirectoryItem = {
 type SchoolAccess = {
   id: string;
   usuario: string;
+  email: string;
+  cpf: string;
   senha: string;
+  nivel: SchoolAccessLevel;
   mustChangePassword: boolean;
   createdAt: string;
 };
@@ -97,6 +128,7 @@ type SchoolAccount = {
 
 type Student = {
   nome: string;
+  idAluno: string;
   nascimento: string;
   nacionalidade: string;
   naturalidadeCidade: string;
@@ -157,6 +189,7 @@ type HistoryRecord = {
   aluno: Student;
   dadosLegais: SchoolLegal;
   matriz: ComponentRow[];
+  modeloCores: HistoryModelColors;
   notas: Record<string, Record<number, string>>;
   notasNegritoAnos: Record<number, boolean>;
   resultados: Record<number, string>;
@@ -166,6 +199,7 @@ type HistoryRecord = {
   usarCarimboEscola: boolean;
   usarAssinaturaDiretor: boolean;
   usarAssinaturaSecretario: boolean;
+  usarQrCode: boolean;
   observacoes: string[];
   fotosHistorico?: {
     frente: string;
@@ -202,6 +236,20 @@ type AppData = {
   transferencias: TransferRequest[];
   admin?: AdminCredentials | null;
   adminUsers?: AdminUser[];
+  modelos?: Record<string, HistoryModel>;
+};
+
+type HistoryModel = {
+  matriz: ComponentRow[];
+  cores: HistoryModelColors;
+  template?: HistoryRecord;
+  updatedAt?: string;
+};
+
+type HistoryModelColors = {
+  destaque: string;
+  apoio: string;
+  borda: string;
 };
 
 type AuthRole = "owner" | "manager" | "school";
@@ -212,12 +260,22 @@ type AuthSession = {
   adminUserId?: string;
   schoolId?: string;
   accessId?: string;
+  accessLevel?: SchoolAccessLevel;
   sessionToken?: string;
 };
 
+type SaveNotice = {
+  message: string;
+  type: "success" | "error";
+};
+
 type AdminCredentials = {
+  nome?: string;
   usuario: string;
+  email?: string;
+  cpf?: string;
   senha: string;
+  mustChangePassword?: boolean;
 };
 
 type SchoolLoginCredentials = AdminCredentials & {
@@ -228,6 +286,8 @@ type AdminUser = {
   id: string;
   nome: string;
   usuario: string;
+  email: string;
+  cpf: string;
   senha: string;
   crede: string;
   nivel: "gestao";
@@ -271,6 +331,10 @@ type PositionedValue = {
   value: string;
   center: number;
 };
+
+type HistoryQrValue =
+  | { kind: "id"; id: string; codigo?: string }
+  | { kind: "record"; record: HistoryRecord };
 
 type FileWriterLike = {
   write: (content: string) => Promise<void>;
@@ -321,6 +385,7 @@ const defaultSchool: School = {
   validade: "31/12/2028",
   logoSistema: "",
   logo: "/model-assets/image1.jpeg",
+  marcaDagua: "/model-assets/image2.png",
   carimboEscola: "",
   diretor: "",
   registroDiretor: "",
@@ -332,7 +397,7 @@ const defaultSchool: School = {
 
 const emptySchool: School = {
   estado: "", municipio: "", nome: "", mantenedora: "", codigo: "", credenciamento: "",
-  autorizacao: "", reconhecimento: "", parecer: "", validade: "", logoSistema: "", logo: "", carimboEscola: "",
+  autorizacao: "", reconhecimento: "", parecer: "", validade: "", logoSistema: "", logo: "", marcaDagua: "", carimboEscola: "",
   diretor: "", registroDiretor: "", assinaturaDiretor: "", secretario: "", registroSecretario: "",
   assinaturaSecretario: "",
 };
@@ -362,13 +427,27 @@ const matrixSeed: ComponentRow[] = [
   { id: "estudo-orientado", area: "Parte Diversificada", nome: "Estudo Orientado", inicio: 1, fim: 9, avaliativo: false },
 ];
 
+const areaOptions: Area[] = [
+  "Linguagens e Codigos",
+  "Cultura e Sociedade",
+  "Ciencias Naturais e Matematica",
+  "Parte Diversificada",
+];
+
+const defaultModelColors: HistoryModelColors = {
+  destaque: "#d9d9d9",
+  apoio: "#eef6f0",
+  borda: "#000000",
+};
+
 const emptyStudent: Student = {
   nome: "",
+  idAluno: "",
   nascimento: "",
   nacionalidade: "BRASILEIRA",
   naturalidadeCidade: defaultSchool.municipio,
   naturalidadeEstado: defaultSchool.estado,
-  identidade: "",
+  identidade: "-",
   pai: "",
   paiNaoDeclarado: false,
   mae: "",
@@ -405,6 +484,24 @@ function formatDate(value: string) {
   return `${day.padStart(2, "0")}/${month.padStart(2, "0")}/${year}`;
 }
 
+function formatActivityTime(value: string | number) {
+  const date = typeof value === "number" ? new Date(value) : new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleString("pt-BR", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function initialsFor(value: string) {
+  const parts = upper(value).split(/\s+/).filter(Boolean);
+  if (!parts.length) return "U";
+  return `${parts[0]?.[0] ?? ""}${parts.length > 1 ? parts[parts.length - 1]?.[0] ?? "" : ""}` || "U";
+}
+
 function upper(value: string) {
   return value ? value.toLocaleUpperCase("pt-BR") : "";
 }
@@ -431,7 +528,30 @@ function uppercaseInput(value: string) {
   return value.toLocaleUpperCase("pt-BR");
 }
 
-const allowedNoteWords = ["CURSANDO", "TRANSFERIDO", "APROVADO", "REPROVADO", "PROGRESSAO", "NAO INFORMADO"];
+function digitsOnly(value: string) {
+  return String(value ?? "").replace(/\D/g, "");
+}
+
+function formatCpf(value: string) {
+  const digits = digitsOnly(value).slice(0, 11);
+  return digits
+    .replace(/^(\d{3})(\d)/, "$1.$2")
+    .replace(/^(\d{3})\.(\d{3})(\d)/, "$1.$2.$3")
+    .replace(/\.(\d{3})(\d)/, ".$1-$2");
+}
+
+function normalizeEmail(value: string) {
+  return String(value ?? "").trim().toLocaleLowerCase("pt-BR");
+}
+
+function normalizeSchoolKind(value?: string): SchoolKind {
+  return value === "estadual" || value === "privada" ? value : "municipal";
+}
+
+function schoolKindLabel(value?: string) {
+  const kind = normalizeSchoolKind(value);
+  return schoolKindOptions.find((option) => option.value === kind)?.label ?? "Municipal";
+}
 
 function normalizeNoteInput(value: string) {
   return uppercaseInput(value)
@@ -443,21 +563,21 @@ function normalizeNoteInput(value: string) {
 function isAllowedNoteTyping(value: string) {
   const text = normalizeNoteInput(value);
   if (!text || text === "-") return true;
-  if (/^[A-ZÀ-Ú\s-]+$/.test(text)) return allowedNoteWords.some((word) => word.startsWith(plain(text)));
+  if (/[^0-9,]/.test(text)) return true;
   return /^(?:10(?:,0?)?|[0-9](?:,[0-9]?)?)$/.test(text);
 }
 
 function isValidNoteValue(value: string) {
   const text = normalizeNoteInput(value);
   if (!text || text === "-") return true;
-  if (allowedNoteWords.includes(plain(text))) return true;
+  if (/[^0-9,]/.test(text)) return true;
   return /^(?:10(?:,0)?|[0-9](?:,[0-9])?)$/.test(text);
 }
 
 function formatNoteValue(value: string) {
   const text = normalizeNoteInput(value);
   if (!text || text === "-") return text;
-  if (allowedNoteWords.includes(plain(text))) return text;
+  if (/[^0-9,]/.test(text)) return text;
   if (!isValidNoteValue(text)) return "";
   const [integer, decimal = "0"] = text.split(",");
   return `${integer},${decimal || "0"}`;
@@ -470,6 +590,14 @@ function safeFileName(value: string) {
     .replace(/[^A-Z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .toLocaleLowerCase("pt-BR");
+}
+
+function safeUpperFileName(value: string) {
+  return (upper(value).trim() || "HISTORICOS")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^A-Z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function safePdfTitle(value: string) {
@@ -769,7 +897,7 @@ function localSchoolDirectory(schools: SchoolAccount[], histories: HistoryRecord
       municipio: uppercaseInput(account.escola.municipio),
       estado: uppercaseInput(account.escola.estado),
       codigo: account.escola.codigo,
-      rede: account.tipo === "estadual" ? "ESTADUAL" : "MUNICIPAL",
+      rede: upper(schoolKindLabel(account.tipo)),
     });
   }
   for (const record of histories) {
@@ -979,15 +1107,19 @@ function removeLightBackground(dataUrl: string) {
   return new Promise<string>((resolve, reject) => {
     const image = new Image();
     image.onload = () => {
+      const maxSide = 720;
+      const sourceWidth = image.naturalWidth || image.width || 1;
+      const sourceHeight = image.naturalHeight || image.height || 1;
+      const scale = Math.min(1, maxSide / Math.max(sourceWidth, sourceHeight));
       const canvas = document.createElement("canvas");
-      canvas.width = image.naturalWidth || image.width;
-      canvas.height = image.naturalHeight || image.height;
+      canvas.width = Math.max(1, Math.round(sourceWidth * scale));
+      canvas.height = Math.max(1, Math.round(sourceHeight * scale));
       const context = canvas.getContext("2d");
       if (!context) {
         resolve(dataUrl);
         return;
       }
-      context.drawImage(image, 0, 0);
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
       const pixels = context.getImageData(0, 0, canvas.width, canvas.height);
       const data = pixels.data;
       for (let index = 0; index < data.length; index += 4) {
@@ -1025,10 +1157,15 @@ function prepareImageForOcr(dataUrl: string) {
     const image = new Image();
     image.onload = () => {
       const maxWidth = 2200;
-      const scale = Math.max(1, Math.min(3, maxWidth / (image.naturalWidth || image.width)));
+      const sourceWidth = image.naturalWidth || image.width;
+      const sourceHeight = image.naturalHeight || image.height;
+      const maxPixels = 2200 * 3000;
+      const widthScale = maxWidth / sourceWidth;
+      const pixelScale = Math.sqrt(maxPixels / Math.max(1, sourceWidth * sourceHeight));
+      const scale = Math.min(1, widthScale, pixelScale);
       const canvas = document.createElement("canvas");
-      canvas.width = Math.round((image.naturalWidth || image.width) * scale);
-      canvas.height = Math.round((image.naturalHeight || image.height) * scale);
+      canvas.width = Math.max(1, Math.round(sourceWidth * scale));
+      canvas.height = Math.max(1, Math.round(sourceHeight * scale));
       const context = canvas.getContext("2d");
       if (!context) {
         resolve(dataUrl);
@@ -1059,7 +1196,7 @@ async function imageFileToOcrPng(file?: File) {
     window.alert("Escolha um arquivo de imagem.");
     return "";
   }
-  return fileToDataUrl(file);
+  return prepareImageForOcr(await fileToDataUrl(file));
 }
 
 function parseTsvWords(tsv: string | null | undefined, page: number): OcrWord[] {
@@ -1142,9 +1279,8 @@ async function recognizeWithMode(
     tessedit_pageseg_mode: mode as import("tesseract.js").PSM,
     user_defined_dpi: "300",
   });
-  const result = await worker.recognize(image, {}, { text: true, blocks: true, tsv: true });
-  const blockWords = wordsFromBlocks(result.data.blocks, page);
-  const words = blockWords.length ? blockWords : parseTsvWords(result.data.tsv, page);
+  const result = await worker.recognize(image, {}, { text: true, tsv: true });
+  const words = parseTsvWords(result.data.tsv, page);
   return {
     text: result.data.text || "",
     words,
@@ -1152,38 +1288,200 @@ async function recognizeWithMode(
   };
 }
 
-async function recognizeHistoryImage(tesseract: typeof import("tesseract.js"), image: string, page: number) {
-  const worker = await tesseract.createWorker("por+eng");
+async function recognizeHistoryImages(sources: Array<{ image: string; page: number }>) {
+  const tesseract: typeof import("tesseract.js") = await import("tesseract.js");
+  let worker: Awaited<ReturnType<typeof import("tesseract.js").createWorker>> | null = null;
   try {
-    const enhanced = await prepareImageForOcr(image);
-    const attempts = [];
-    for (const source of [image, enhanced]) {
-      for (const mode of ["6", "11", "3"]) {
-        attempts.push(await recognizeWithMode(worker, source, page, mode));
+    worker = await tesseract.createWorker("por+eng");
+  } catch {
+    worker = await tesseract.createWorker("eng");
+  }
+  try {
+    const results = [];
+    for (const source of sources) {
+      try {
+        let best = await recognizeWithMode(worker, source.image, source.page, "6");
+        if (best.score < 260) {
+          const tableMode = await recognizeWithMode(worker, source.image, source.page, "4");
+          if (tableMode.score > best.score) best = tableMode;
+        }
+        if (best.score < 260) {
+          const sparseMode = await recognizeWithMode(worker, source.image, source.page, "11");
+          if (sparseMode.score > best.score) best = sparseMode;
+        }
+        results.push(best);
+        await new Promise((resolve) => window.setTimeout(resolve, 120));
+      } catch {
+        // Mantem a tela aberta e permite conferir/preencher manualmente.
       }
     }
-    const orderedAttempts = attempts.sort((a, b) => b.score - a.score);
-    const best = orderedAttempts[0] ?? { text: "", words: [], score: 0 };
-    const mergedText = Array.from(new Set(orderedAttempts.map((attempt) => attempt.text.trim()).filter(Boolean))).join("\n");
     return {
-      text: mergedText || best.text,
-      words: best.words,
+      text: results.map((result) => result.text.trim()).filter(Boolean).join("\n"),
+      words: results.flatMap((result) => result.words),
     };
   } finally {
-    await worker.terminate();
+    await worker?.terminate();
   }
 }
 
-async function readHistoryTextFromImages(front: string, back: string) {
-  const tesseract: typeof import("tesseract.js") = await import("tesseract.js");
-  const [frontResult, backResult] = await Promise.all([
-    recognizeHistoryImage(tesseract, front, 1),
-    recognizeHistoryImage(tesseract, back, 2),
-  ]);
-  return {
-    text: `${frontResult.text}\n${backResult.text}`,
-    words: [...frontResult.words, ...backResult.words],
-  };
+async function readHistoryTextFromImages(front?: string, back?: string) {
+  const sources = [
+    front ? { image: front, page: 1 } : null,
+    back ? { image: back, page: 2 } : null,
+  ].filter((item): item is { image: string; page: number } => Boolean(item));
+  if (!sources.length) return { text: "", words: [] };
+  return recognizeHistoryImages(sources);
+}
+
+type BrowserBarcodeDetector = {
+  detect: (source: CanvasImageSource) => Promise<Array<{ rawValue?: string }>>;
+};
+
+function qrDetectorClass() {
+  return (window as unknown as {
+    BarcodeDetector?: new (options: { formats: string[] }) => BrowserBarcodeDetector;
+  }).BarcodeDetector;
+}
+
+function imageElementFromDataUrl(dataUrl: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Imagem invalida"));
+    image.src = dataUrl;
+  });
+}
+
+async function readQrFromImage(dataUrl: string) {
+  const Detector = qrDetectorClass();
+  const image = await imageElementFromDataUrl(dataUrl);
+  if (Detector) {
+    const detector = new Detector({ formats: ["qr_code"] });
+    const codes = await detector.detect(image);
+    const nativeValue = codes.map((code) => code.rawValue || "").find(Boolean);
+    if (nativeValue) return nativeValue;
+  }
+  const canvas = document.createElement("canvas");
+  const width = image.naturalWidth || image.width;
+  const height = image.naturalHeight || image.height;
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) return "";
+  context.drawImage(image, 0, 0, width, height);
+  const pixels = context.getImageData(0, 0, width, height);
+  const jsQrModule = await import("jsqr");
+  const jsQr = jsQrModule.default;
+  const code = jsQr(pixels.data, pixels.width, pixels.height);
+  return code?.data || "";
+}
+
+async function readQrFromImages(front?: string, back?: string) {
+  for (const image of [front, back]) {
+    if (!image) continue;
+    const value = await readQrFromImage(image).catch(() => "");
+    if (value) return value;
+  }
+  return "";
+}
+
+function parseHistoryQrValue(text: string): HistoryQrValue | null {
+  const trimmed = text.trim();
+  try {
+    const url = new URL(trimmed);
+    const id = url.searchParams.get("h") || url.searchParams.get("q") || url.searchParams.get("historicoQr") || url.searchParams.get("historico") || url.searchParams.get("id");
+    if (id) return { kind: "id", id, codigo: url.searchParams.get("c") || url.searchParams.get("codigo") || undefined };
+  } catch {
+    // Nao e URL; tenta os outros formatos.
+  }
+  const idMatch = trimmed.match(/^HE-ID:([A-Z0-9-]+)(?:\|(.+))?$/i);
+  if (idMatch) return { kind: "id", id: idMatch[1], codigo: idMatch[2] };
+
+  const candidates = [trimmed];
+  try {
+    const url = new URL(trimmed);
+    ["historico", "he", "data"].forEach((key) => {
+      const value = url.searchParams.get(key);
+      if (value) candidates.push(value);
+    });
+  } catch {
+    // Nao e URL; tenta o texto direto.
+  }
+  if (/^he:/i.test(trimmed)) candidates.push(trimmed.slice(3));
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      const source = parsed?.historico ?? parsed?.record ?? parsed;
+      if (source?.aluno && source?.matriz) return { kind: "record", record: source };
+    } catch {
+      try {
+        const parsed = JSON.parse(atob(candidate));
+        const source = parsed?.historico ?? parsed?.record ?? parsed;
+        if (source?.aluno && source?.matriz) return { kind: "record", record: source };
+      } catch {
+        // Tenta o proximo formato.
+      }
+    }
+  }
+  return null;
+}
+
+function historyFromSharedText(text: string, base: HistoryRecord, records: HistoryRecord[] = []) {
+  const parsed = parseHistoryQrValue(text);
+  if (!parsed) return null;
+  const source = parsed.kind === "id"
+    ? records.find((record) => record.id === parsed.id || record.codigo === parsed.codigo)
+    : parsed.record;
+  if (!source) return null;
+  return normalizeHistory({
+    ...source,
+    id: base.id,
+    schoolId: base.schoolId,
+    folderId: base.folderId,
+    anoLetivo: base.anoLetivo,
+    codigo: base.codigo,
+  } as HistoryRecord, base.schoolId, []);
+}
+
+function historyQrText(record: HistoryRecord) {
+  const params = new URLSearchParams({ h: record.id, c: record.codigo });
+  if (typeof window !== "undefined") return `${window.location.origin}/?${params.toString()}`;
+  return `HE-ID:${record.id}|${record.codigo}`;
+}
+
+function HistoryQrCode({ record }: { record: HistoryRecord }) {
+  const [qr, setQr] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    const makeQr = async () => {
+      try {
+        const qrcode = await import("qrcode");
+        const value = await qrcode.toDataURL(historyQrText(record), {
+          errorCorrectionLevel: "Q",
+          margin: 2,
+          width: 260,
+          color: {
+            dark: "#000000",
+            light: "#ffffff",
+          },
+        });
+        if (!cancelled) setQr(value);
+      } catch {
+        if (!cancelled) setQr("");
+      }
+    };
+    void makeQr();
+    return () => { cancelled = true; };
+  }, [record.id, record.codigo]);
+
+  if (!qr) return null;
+  return (
+    <div className="history-qr">
+      <img src={qr} alt="" />
+      <span>{record.codigo}</span>
+    </div>
+  );
 }
 
 async function recordsFromComputerFolder(directory: DirectoryHandleLike, fallbackName: string) {
@@ -1218,8 +1516,8 @@ async function recordsFromComputerFolder(directory: DirectoryHandleLike, fallbac
   return { folderName: fallbackName, records };
 }
 
-function createBlankNotes() {
-  return matrixSeed.reduce<Record<string, Record<number, string>>>((acc, component) => {
+function createBlankNotes(rows = matrixSeed) {
+  return rows.reduce<Record<string, Record<number, string>>>((acc, component) => {
     acc[component.id] = {};
     return acc;
   }, {});
@@ -1232,7 +1530,7 @@ function createBlankNoteBoldYears() {
   }, {});
 }
 
-function createHistory(school: School, schoolId = "", folder?: Folder | null): HistoryRecord {
+function createHistory(school: School, schoolId = "", folder?: Folder | null, modelRows = matrixSeed): HistoryRecord {
   const carga = years.reduce<Record<number, WorkloadRow>>((acc, year) => {
     acc[year] = {
       oferta: "",
@@ -1268,8 +1566,9 @@ function createHistory(school: School, schoolId = "", folder?: Folder | null): H
       parecer: school.parecer || defaultSchool.parecer,
       validade: school.validade || defaultSchool.validade,
     },
-    matriz: matrixSeed,
-    notas: createBlankNotes(),
+    matriz: cloneMatrix(modelRows),
+    modeloCores: normalizeModelColors(),
+    notas: createBlankNotes(modelRows),
     notasNegritoAnos: createBlankNoteBoldYears(),
     resultados: years.reduce<Record<number, string>>((acc, year) => {
       acc[year] = "";
@@ -1289,6 +1588,7 @@ function createHistory(school: School, schoolId = "", folder?: Folder | null): H
     usarCarimboEscola: false,
     usarAssinaturaDiretor: false,
     usarAssinaturaSecretario: false,
+    usarQrCode: true,
     observacoes: [""],
     localData: {
       municipio: school.municipio || defaultSchool.municipio,
@@ -1297,6 +1597,38 @@ function createHistory(school: School, schoolId = "", folder?: Folder | null): H
     },
   };
   return record;
+}
+
+function createHistoryFromModel(school: School, schoolId = "", folder?: Folder | null, model?: HistoryModel): HistoryRecord {
+  const cleanModel = normalizeModel(model);
+  const base = createHistory(school, schoolId, folder, cleanModel.matriz);
+  if (!cleanModel.template) return { ...base, modeloCores: cleanModel.cores };
+
+  const template = normalizeModelTemplate(cleanModel.template, schoolId);
+  return {
+    ...base,
+    dadosLegais: { ...template.dadosLegais },
+    matriz: cloneMatrix(template.matriz),
+    modeloCores: cleanModel.cores,
+    notas: normalizeNotesForMatrix(template.notas, template.matriz),
+    notasNegritoAnos: { ...template.notasNegritoAnos },
+    resultados: { ...template.resultados },
+    cargaHoraria: cloneRecord(template.cargaHoraria),
+    estudos: template.estudos.map((row) => ({ ...row })),
+    certificado: { ...template.certificado },
+    usarCarimboEscola: template.usarCarimboEscola,
+    usarAssinaturaDiretor: template.usarAssinaturaDiretor,
+    usarAssinaturaSecretario: template.usarAssinaturaSecretario,
+    usarQrCode: template.usarQrCode !== false,
+    observacoes: [...template.observacoes],
+    localData: {
+      ...template.localData,
+      municipio: template.localData.municipio || school.municipio || defaultSchool.municipio,
+      estado: template.localData.estado || school.estado || defaultSchool.estado,
+      data: todayIsoDate(),
+    },
+    aluno: studentDefaultsForSchool(school),
+  };
 }
 
 function findFirstDate(text: string) {
@@ -1311,10 +1643,25 @@ function findFirstDate(text: string) {
 function cleanOcrField(value: string) {
   return plain(value)
     .replace(/^(?:NOME\s+(?:DO\s+)?ALUNO|NOME\s+DO\s+PAI|NOME\s+DA\s+MAE|NOME|ALUNO|DATA\s+DE\s+NASCIMENTO|NASCIMENTO|NASC|NACIONALIDADE|NATURALIDADE|IDENTIDADE|RG|PAI|MAE|FILIA[CÇ][AÃ]O|SEXO|CPF)\s*[:.\-]*/i, "")
+    .replace(/\s+(?:NOME\s+(?:DO\s+)?ALUNO|NOME\s+DO\s+PAI|NOME\s+DA\s+MAE|DATA\s+DE\s+NASCIMENTO|NASCIMENTO|NASC|NACIONALIDADE|NATURALIDADE|IDENTIDADE|RG|CPF|SEXO|FILIA[CÇ][AÃ]O|PAI|MAE|PORTUGUES|MATEMATICA|HISTORIA|GEOGRAFIA|CIENCIAS|RESULTADO|CARGA|CARGA\s+HORARIA|FREQUENCIA)\b.*$/i, "")
     .replace(/\s+(?:DATA\s+DE\s+NASCIMENTO|NASCIMENTO|NASC|NACIONALIDADE|NATURALIDADE|IDENTIDADE|RG|CPF|SEXO|FILIA[CÇ][AÃ]O|NOME\s+DO\s+PAI|NOME\s+DA\s+MAE|PAI|MAE)\b.*$/i, "")
     .replace(/^[^A-Z0-9]+|[^A-Z0-9]+$/g, "")
     .replace(/\s{2,}/g, " ")
     .trim();
+}
+
+function findLineFieldValue(lines: string[], labels: string[]) {
+  const normalizedLines = lines.map(plain);
+  for (const line of normalizedLines) {
+    for (const label of labels) {
+      const normalizedLabel = plain(label);
+      const match = line.match(new RegExp(`^${normalizedLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*[:.\\-]?\\s*(.+)$`));
+      if (!match) continue;
+      const value = cleanOcrField(match[1]);
+      if (value.length >= 2) return value;
+    }
+  }
+  return "";
 }
 
 function findLabeledValue(lines: string[], labels: string[]) {
@@ -1322,9 +1669,10 @@ function findLabeledValue(lines: string[], labels: string[]) {
   for (let lineIndex = 0; lineIndex < normalizedLines.length; lineIndex += 1) {
     const normalized = normalizedLines[lineIndex];
     for (const label of labels) {
-      const index = normalized.indexOf(label);
-      if (index < 0) continue;
-      const value = cleanOcrField(normalized.slice(index + label.length));
+      const escapedLabel = plain(label).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const match = normalized.match(new RegExp(`(?:^|\\s)${escapedLabel}(?:\\s*[:.\\-]?\\s*)`));
+      if (!match || match.index === undefined) continue;
+      const value = cleanOcrField(normalized.slice(match.index + match[0].length));
       if (value.length >= 3) return value;
       const next = cleanOcrField(normalizedLines[lineIndex + 1] || "");
       if (next.length >= 3 && !/ESCOLA|HISTORICO|CERTIFICADO|ENSINO|MUNICIPIO|ESTADO/.test(next)) return next;
@@ -1337,11 +1685,17 @@ function findFieldValue(rawText: string, labels: string[], stopLabels: string[] 
   const normalized = plain(rawText).replace(/\n/g, " ");
   for (const label of labels) {
     const normalizedLabel = plain(label);
-    const index = normalized.indexOf(normalizedLabel);
-    if (index < 0) continue;
-    const start = index + normalizedLabel.length;
+    const escapedLabel = normalizedLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = normalized.match(new RegExp(`(?:^|\\s)${escapedLabel}(?:\\s*[:.\\-]?\\s*)`));
+    if (!match || match.index === undefined) continue;
+    const start = match.index + match[0].length;
     const stopIndexes = stopLabels
-      .map((stop) => normalized.indexOf(plain(stop), start))
+      .map((stop) => {
+        const normalizedStop = plain(stop);
+        const escapedStop = normalizedStop.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const stopMatch = normalized.slice(start).match(new RegExp(`(?:^|\\s)${escapedStop}(?:\\s*[:.\\-]?\\s*)`));
+        return stopMatch?.index === undefined ? -1 : start + stopMatch.index;
+      })
       .filter((stopIndex) => stopIndex > start)
       .sort((a, b) => a - b);
     const end = stopIndexes[0] ?? normalized.length;
@@ -1389,9 +1743,33 @@ function workloadValuesFromText(text: string, maxNumber = 2000) {
   );
 }
 
+function yearValuePairsFromText(text: string, maxNumber = 100) {
+  const normalized = plain(text);
+  const valuePattern = maxNumber <= 100
+    ? "(APROVADO|REPROVADO|TRANSFERIDO|CURSANDO|PROGRESSAO|PROG|10(?:[,.]0)?|[0-9](?:[,.][0-9])?)"
+    : "([0-9]{1,4}(?:[,.][0-9])?%?)";
+  const pairs = Array.from(normalized.matchAll(new RegExp(`\\b([1-9])\\s*(?:O|º|°|A|ª)?\\s*(?:ANO|SERIE)?\\D{0,28}?${valuePattern}\\b`, "g")))
+    .map((match) => {
+      const year = Number(match[1]);
+      const value = (match[2] || match[3] || "").replace(".", ",");
+      const numeric = Number(value.replace("%", "").replace(",", "."));
+      if (!year || year < 1 || year > 9) return null;
+      if (!Number.isNaN(numeric) && (numeric < 0 || numeric > maxNumber)) return null;
+      return { year, value: value === "PROG" ? "PROGRESSAO" : value };
+    })
+    .filter((item): item is { year: number; value: string } => Boolean(item?.value));
+  return Array.from(new Map(pairs.map((item) => [item.year, item])).values());
+}
+
 function explicitSchoolYearFromText(text: string) {
   const normalized = plain(text);
   const match = normalized.match(/\b([1-9])\s*(?:O|º|°)?\s*ANO\b/) || normalized.match(/\b([1-9])\s*(?:A|ª)?\s*SERIE\b/);
+  return match ? Number(match[1]) : null;
+}
+
+function ocrYearFromWord(text: string) {
+  const compact = compactPlain(text);
+  const match = compact.match(/^([1-9])(?:O|ANO|SERIE)?$/);
   return match ? Number(match[1]) : null;
 }
 
@@ -1409,18 +1787,61 @@ function textAfterFirstLabel(text: string, labels: string[]) {
   return bestIndex >= 0 ? normalized.slice(bestEnd) : normalized;
 }
 
+function labelsForComponent(component: ComponentRow) {
+  const fromModel = plain(component.nome).split(/\s+/).filter((token) => token.length > 2);
+  return Array.from(new Set([...(componentAliases[component.id] ?? []), component.nome, plain(component.nome), ...fromModel]));
+}
+
+function rowMatchesComponent(rowText: string, component: ComponentRow) {
+  const text = plain(rowText);
+  if (!rowHasLabel(text, labelsForComponent(component))) return false;
+  if (component.id === "portugues" && /\bPORTUGUES\s*(?:II|2)\b/.test(text)) return false;
+  if (component.id === "matematica" && /\bMATEMATICA\s*(?:II|2)\b/.test(text)) return false;
+  return true;
+}
+
+function cleanOcrPerson(value: string) {
+  return cleanOcrField(value)
+    .replace(/\b(?:BRASILEIR[OA]|NATURAL|SOLTEIR[OA]|MASCULINO|FEMININO|ENSINO|FUNDAMENTAL|HISTORICO|ESCOLAR)\b/g, " ")
+    .replace(/\b\d{1,4}(?:[,.]\d)?\b/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function cleanStudentId(value: string) {
+  return cleanOcrField(value)
+    .replace(/\b(?:ID|ALUNO|NUMERO|N|NO|DO|DA|CENSO|INEP|CODIGO|MATRICULA)\b/g, " ")
+    .replace(/[^A-Z0-9./-]/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function splitNaturalidade(value: string, fallbackCity: string, fallbackState: string) {
+  const cleaned = cleanOcrField(value)
+    .replace(/\b(?:NOME DO|NOME DA|PAI|MAE|DATA DE NASCIMENTO|NASCIMENTO|NACIONALIDADE|IDENTIDADE|RG|CPF)\b.*$/g, "")
+    .trim();
+  const ufMatch = cleaned.match(/\b(AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|RO|RR|SC|SP|SE|TO)\b/);
+  const state = ufMatch?.[1] || fallbackState;
+  const city = cleaned
+    .replace(/\b(AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|RO|RR|SC|SP|SE|TO)\b/g, "")
+    .split(/[-/]/)[0]
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  return [city || fallbackCity, state] as const;
+}
+
 const componentAliases: Record<string, string[]> = {
-  portugues: ["PORTUGUES", "LINGUA PORTUGUESA"],
-  "portugues-ii": ["PORTUGUES II"],
-  arte: ["ARTE"],
-  "educacao-fisica": ["EDUCACAO FISICA"],
-  ingles: ["INGLES", "L EST MODERNA"],
-  historia: ["HISTORIA"],
-  geografia: ["GEOGRAFIA"],
-  religioso: ["RELIGIOSO"],
-  ciencias: ["CIENCIAS"],
-  matematica: ["MATEMATICA"],
-  "matematica-ii": ["MATEMATICA II"],
+  portugues: ["PORTUGUES", "LINGUA PORTUGUESA", "L PORTUGUESA", "LING PORTUGUESA", "LP"],
+  "portugues-ii": ["PORTUGUES II", "PORTUGUES 2", "LINGUA PORTUGUESA II"],
+  arte: ["ARTE", "ARTES", "ARTE EDUCACAO", "EDUCACAO ARTISTICA"],
+  "educacao-fisica": ["EDUCACAO FISICA", "ED FISICA", "EDUC FISICA"],
+  ingles: ["INGLES", "L EST MODERNA", "LINGUA INGLESA", "LINGUA ESTRANGEIRA"],
+  historia: ["HISTORIA", "HIST"],
+  geografia: ["GEOGRAFIA", "GEOG"],
+  religioso: ["RELIGIOSO", "ENSINO RELIGIOSO"],
+  ciencias: ["CIENCIAS", "CIENCIAS NATURAIS"],
+  matematica: ["MATEMATICA", "MAT"],
+  "matematica-ii": ["MATEMATICA II", "MATEMATICA 2", "MAT II"],
   "atividades-artisticas": ["ATIVIDADES ARTISTICAS", "EDUCACAO CORPORAL", "SAUDE"],
   caerer: ["CAER", "CONSCIENCIA AMBIENTAL", "ETNICO"],
   "circulo-leitura": ["CIRCULO DE LEITURA", "LEITURA"],
@@ -1435,8 +1856,7 @@ const componentAliases: Record<string, string[]> = {
 };
 
 function bestLineForComponent(lines: string[], component: ComponentRow) {
-  const tokens = componentAliases[component.id] ?? plain(component.nome).split(" ").filter((token) => token.length > 4);
-  const index = lines.findIndex((line) => tokens.some((token) => line.includes(token)));
+  const index = lines.findIndex((line) => rowMatchesComponent(line, component));
   return index >= 0 ? lines[index] : "";
 }
 
@@ -1449,6 +1869,47 @@ function resultWordsFromText(text: string) {
   return Array.from(text.matchAll(/\b(APROVADO|REPROVADO|TRANSFERIDO|CURSANDO|PROGRESSAO|PROG)\b/g))
     .map((match) => match[1] === "PROG" ? "PROGRESSAO" : match[1])
     .slice(0, 9);
+}
+
+function cleanStudySource(value: string) {
+  return plain(value)
+    .replace(/\b(?:ESTABELECIMENTO|ENSINO|ESCOLA|ORIGEM|ESTUDOS|REALIZADOS|MUNICIPIO|CIDADE|ESTADO|UF|ANO|SERIE|RESULTADO|APROVADO|REPROVADO|CURSANDO|TRANSFERIDO|PROGRESSAO)\b/g, " ")
+    .replace(/\b(?:19|20)\d{2}\b/g, " ")
+    .replace(/\b(AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|RO|RR|SC|SP|SE|TO)\b/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function findDirectorySchoolInText(text: string, directory: SchoolDirectoryItem[] = []) {
+  const normalized = plain(text);
+  return directory
+    .map((school) => ({ school, name: plain(school.nome) }))
+    .filter((item) => item.name.length >= 8 && normalized.includes(item.name))
+    .sort((a, b) => b.name.length - a.name.length)[0]?.school ?? null;
+}
+
+function fillStudiesFromText(record: HistoryRecord, normalizedLines: string[], directory: SchoolDirectoryItem[] = []) {
+  const estudos = record.estudos.map((study) => ({ ...study }));
+  normalizedLines.forEach((line, lineIndex) => {
+    const context = [line, normalizedLines[lineIndex + 1] || ""].join(" ");
+    const seriesYear = explicitSchoolYearFromText(context);
+    if (!seriesYear || seriesYear < 1 || seriesYear > 9) return;
+    const study = estudos[seriesYear - 1];
+    const yearMatch = context.match(/\b(?:19|20)\d{2}\b/);
+    const stateMatch = context.match(/\b(AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|RO|RR|SC|SP|SE|TO)\b/);
+    const directorySchool = findDirectorySchoolInText(context, directory);
+    const labels = [`${seriesYear} ANO`, `${seriesYear}O ANO`, `${seriesYear} SERIE`, `${seriesYear}A SERIE`];
+    const escola = directorySchool?.nome || cleanStudySource(textAfterFirstLabel(context, labels));
+    estudos[seriesYear - 1] = {
+      ...study,
+      ativo: true,
+      ano: study.ano || yearMatch?.[0] || "",
+      escola: study.escola || escola,
+      cidade: study.cidade || directorySchool?.municipio || "",
+      estado: study.estado || directorySchool?.estado || stateMatch?.[1] || "",
+    };
+  });
+  return estudos;
 }
 
 function wordRows(words: OcrWord[]) {
@@ -1478,7 +1939,11 @@ function rowHasLabel(rowText: string, labels: string[]) {
     const normalizedLabel = plain(label);
     const labelCompact = compactPlain(label);
     const labelWords = normalizedLabel.split(/\s+/).filter((word) => word.length > 1 && !/^(DO|DA|DE|DOS|DAS|A|O|E)$/.test(word));
-    return text.includes(normalizedLabel) || Boolean(labelCompact && compact.includes(labelCompact)) || Boolean(labelWords.length && labelWords.every((word) => text.includes(word)));
+    if (!normalizedLabel) return false;
+    if (normalizedLabel.length <= 4) return new RegExp(`(^|\\s)${normalizedLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\s|$)`).test(text);
+    return text.includes(normalizedLabel)
+      || Boolean(labelCompact.length > 4 && compact.includes(labelCompact))
+      || Boolean(labelWords.length && labelWords.every((word) => new RegExp(`(^|\\s)${word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\s|$)`).test(text)));
   });
 }
 
@@ -1492,20 +1957,27 @@ function labelBoundsInRow(rowWords: OcrWord[], labels: string[]) {
     for (let start = 0; start < normalizedWords.length; start += 1) {
       const slice = normalizedWords.slice(start, start + labelParts.length).join("");
       const target = labelParts.join("");
-      if (slice === target || slice.includes(target) || target.includes(slice)) {
+      const matched = target.length <= 4
+        ? slice === target
+        : slice === target || slice.includes(target) || target.includes(slice);
+      if (matched) {
         const firstWord = rowWords[start];
         const lastWord = rowWords[Math.min(start + labelParts.length - 1, rowWords.length - 1)];
         return { start: firstWord.left, end: lastWord.left + lastWord.width };
       }
     }
-    const lastLabelWordIndex = rowWords.findLastIndex((word) => {
-      const compact = compactPlain(word.text);
-      return labelParts.some((part) => compact.includes(part) || part.includes(compact));
-    });
+    let lastLabelWordIndex = -1;
+    for (let index = rowWords.length - 1; index >= 0; index -= 1) {
+      const compact = compactPlain(rowWords[index].text);
+      if (labelParts.some((part) => compact === part || (part.length > 4 && compact.includes(part)) || (compact.length > 4 && part.includes(compact)))) {
+        lastLabelWordIndex = index;
+        break;
+      }
+    }
     if (lastLabelWordIndex >= 0) {
       const labelWords = rowWords.filter((word) => labelParts.some((part) => {
         const compact = compactPlain(word.text);
-        return compact.includes(part) || part.includes(compact);
+        return compact === part || (part.length > 4 && compact.includes(part)) || (compact.length > 4 && part.includes(compact));
       }));
       const start = Math.min(...labelWords.map((word) => word.left));
       const lastWord = rowWords[lastLabelWordIndex];
@@ -1581,8 +2053,8 @@ function detectYearColumns(rows: OcrRow[]): YearColumn[] {
         const current = compactPlain(word.text);
         const next = compactPlain(row.words[index + 1]?.text || "");
         const previous = compactPlain(row.words[index - 1]?.text || "");
-        const year = Number(current);
-        if (year >= 1 && year <= 9 && (next.startsWith("ANO") || previous.startsWith("ANO"))) {
+        const year = ocrYearFromWord(current);
+        if (year && year >= 1 && year <= 9 && (next.startsWith("ANO") || previous.startsWith("ANO"))) {
           columns.push({ year, page: row.page, center: word.left + word.width / 2 });
         }
       });
@@ -1591,6 +2063,25 @@ function detectYearColumns(rows: OcrRow[]): YearColumn[] {
     .filter((columns) => columns.length >= 3)
     .sort((a, b) => b.length - a.length)[0];
 
+  if (!candidates?.length) return [];
+  const seen = new Set<number>();
+  return candidates
+    .sort((a, b) => a.center - b.center)
+    .filter((column) => {
+      if (seen.has(column.year)) return false;
+      seen.add(column.year);
+      return true;
+    })
+    .slice(0, 9);
+}
+
+function detectLooseYearColumns(rows: OcrRow[]): YearColumn[] {
+  const candidates = rows
+    .map((row) => row.words
+      .map((word) => ({ year: ocrYearFromWord(word.text), page: row.page, center: word.left + word.width / 2 }))
+      .filter((item): item is YearColumn => Boolean(item.year && item.year >= 1 && item.year <= 9)))
+    .filter((columns) => columns.length >= 4)
+    .sort((a, b) => b.length - a.length)[0];
   if (!candidates?.length) return [];
   const seen = new Set<number>();
   return candidates
@@ -1653,13 +2144,13 @@ function assignPositionedComponentValues(
 function fillTableFromWords(record: HistoryRecord, words: OcrWord[]) {
   const rows = wordRows(words);
   const columns = detectYearColumns(rows);
+  const fallbackColumns = columns.length ? columns : detectLooseYearColumns(rows);
   const notas = { ...record.notas };
   const cargaHoraria = { ...record.cargaHoraria };
   const resultados = { ...record.resultados };
 
   for (const component of record.matriz) {
-    const tokens = componentAliases[component.id] ?? plain(component.nome).split(" ").filter((token) => token.length > 4);
-    const rowIndex = rows.findIndex((item) => tokens.some((token) => plain(item.text).includes(token)));
+    const rowIndex = rows.findIndex((item) => rowMatchesComponent(item.text, component));
     const row = rowIndex >= 0 ? rows[rowIndex] : null;
     if (!row) continue;
     const sameRowValues = positionedValuesAfterLabel(row, tokens);
@@ -1668,7 +2159,7 @@ function fillTableFromWords(record: HistoryRecord, words: OcrWord[]) {
       : [];
     const sourceRow = sameRowValues.length ? row : rows[rowIndex + 1];
     const assigned = sourceRow
-      ? assignPositionedComponentValues(notas, component, sameRowValues.length ? sameRowValues : nextRowValues, sourceRow, columns)
+      ? assignPositionedComponentValues(notas, component, sameRowValues.length ? sameRowValues : nextRowValues, sourceRow, fallbackColumns)
       : false;
     if (!assigned) assignComponentValues(notas, component, (sameRowValues.length ? sameRowValues : nextRowValues).map((item) => item.value));
   }
@@ -1682,15 +2173,21 @@ function fillTableFromWords(record: HistoryRecord, words: OcrWord[]) {
     const row = rows.find((item) => rowHasLabel(item.text, labels));
     if (!row) continue;
     const maxNumber = key === "percentual" ? 100 : 2000;
+    const rowIndex = rows.indexOf(row);
     const positioned = positionedValuesAfterLabel(row, labels, maxNumber);
-    if (columns.length) {
-      positioned.forEach((item) => {
-        const year = nearestYearForValue(item, columns, row.page);
+    const nextPositioned = !positioned.length && rows[rowIndex + 1]
+      ? positionedValuesAfterLabel(rows[rowIndex + 1], [], maxNumber)
+      : [];
+    const sourceValues = positioned.length ? positioned : nextPositioned;
+    const sourceRow = positioned.length ? row : rows[rowIndex + 1];
+    if (fallbackColumns.length && sourceRow) {
+      sourceValues.forEach((item) => {
+        const year = nearestYearForValue(item, fallbackColumns, sourceRow.page);
         if (year) cargaHoraria[year] = { ...cargaHoraria[year], [key]: item.value };
       });
       return;
     }
-    positioned.forEach((item, index) => {
+    sourceValues.forEach((item, index) => {
       cargaHoraria[index + 1] = { ...cargaHoraria[index + 1], [key]: item.value };
     });
   }
@@ -1721,12 +2218,17 @@ function fillTableFromText(
     const explicitYear = explicitSchoolYearFromText(context);
 
     for (const component of record.matriz) {
-      const labels = componentAliases[component.id] ?? [component.nome];
-      if (!rowHasLabel(context, labels)) continue;
-      const values = noteValuesFromText(textAfterFirstLabel(context, labels));
-      if (!values.length) continue;
+      const labels = labelsForComponent(component);
       notas[component.id] = { ...(notas[component.id] ?? {}) };
-      if (explicitYear && explicitYear >= component.inicio && explicitYear <= component.fim) {
+      if (!rowMatchesComponent(context, component)) continue;
+      const sourceText = textAfterFirstLabel(context, labels);
+      const pairs = yearValuePairsFromText(sourceText);
+      const values = noteValuesFromText(sourceText);
+      if (pairs.length) {
+        pairs.forEach(({ year, value }) => {
+          if (year >= component.inicio && year <= component.fim) notas[component.id][year] = value;
+        });
+      } else if (explicitYear && explicitYear >= component.inicio && explicitYear <= component.fim && values[0]) {
         notas[component.id][explicitYear] = values[0];
       } else {
         assignComponentValues(notas, component, values);
@@ -1741,7 +2243,15 @@ function fillTableFromText(
     ];
     workloadMap.forEach(([key, labels, maxNumber]) => {
       if (!rowHasLabel(context, labels)) return;
-      const values = workloadValuesFromText(textAfterFirstLabel(context, labels), maxNumber);
+      const sourceText = textAfterFirstLabel(context, labels);
+      const pairs = yearValuePairsFromText(sourceText, maxNumber);
+      const values = workloadValuesFromText(sourceText, maxNumber);
+      if (pairs.length) {
+        pairs.forEach(({ year, value }) => {
+          cargaHoraria[year] = { ...cargaHoraria[year], [key]: value };
+        });
+        return;
+      }
       if (!values.length) return;
       if (explicitYear) {
         cargaHoraria[explicitYear] = { ...cargaHoraria[explicitYear], [key]: values[0] };
@@ -1768,21 +2278,29 @@ function fillTableFromText(
   return { notas, cargaHoraria, resultados };
 }
 
-function applyOcrTextToHistory(record: HistoryRecord, rawText: string, words: OcrWord[] = []): HistoryRecord {
+function applyOcrTextToHistory(record: HistoryRecord, rawText: string, words: OcrWord[] = [], schoolDirectory: SchoolDirectoryItem[] = []): HistoryRecord {
   const lines = rawText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const normalizedLines = lines.map(plain);
   const normalizedText = normalizedLines.join("\n");
-  const studentName =
-    valueRightOfLabel(words, ["NOME DO ALUNO", "NOME DO A ALUNO A", "ALUNO", "NOME"], ["DATA DE NASCIMENTO", "NASCIMENTO", "NACIONALIDADE", "NATURALIDADE", "IDENTIDADE", "RG"]) ||
-    findFieldValue(rawText, ["NOME DO ALUNO", "NOME DO A ALUNO A", "NOME DO(A) ALUNO(A)", "ALUNO"], ["DATA DE NASCIMENTO", "NASCIMENTO", "NACIONALIDADE", "NATURALIDADE", "IDENTIDADE", "RG", "FILIAÇÃO", "FILIACAO", "PAI", "MAE"]) ||
-    findLabeledValue(lines, ["NOME DO ALUNO", "NOME DO(A) ALUNO(A)", "ALUNO", "NOME"]);
+  const studentName = cleanOcrPerson(
+    valueRightOfLabel(words, ["NOME DO ALUNO", "NOME DO A ALUNO A", "ALUNO", "NOME"], ["ID DO ALUNO", "ID ALUNO", "NUMERO DO ALUNO", "MATRICULA", "DATA DE NASCIMENTO", "NASCIMENTO", "NACIONALIDADE", "NATURALIDADE", "IDENTIDADE", "RG"]) ||
+    findLineFieldValue(lines, ["NOME DO ALUNO", "NOME DO(A) ALUNO(A)", "ALUNO"]) ||
+    findFieldValue(rawText, ["NOME DO ALUNO", "NOME DO A ALUNO A", "NOME DO(A) ALUNO(A)", "ALUNO"], ["ID DO ALUNO", "ID ALUNO", "NUMERO DO ALUNO", "MATRICULA", "DATA DE NASCIMENTO", "NASCIMENTO", "NACIONALIDADE", "NATURALIDADE", "IDENTIDADE", "RG", "FILIAÇÃO", "FILIACAO", "PAI", "MAE"]) ||
+    findLabeledValue(lines, ["NOME DO ALUNO", "NOME DO(A) ALUNO(A)", "ALUNO", "NOME"]),
+  );
+  const studentId = cleanStudentId(
+    valueRightOfLabel(words, ["ID DO ALUNO", "ID ALUNO", "NUMERO DO ALUNO", "NUMERO DO ALUNO NO CENSO", "MATRICULA", "CODIGO DO ALUNO"], ["NOME DO ALUNO", "ALUNO", "DATA DE NASCIMENTO", "NASCIMENTO", "NACIONALIDADE", "NATURALIDADE"]) ||
+    findLineFieldValue(lines, ["ID DO ALUNO", "ID ALUNO", "NUMERO DO ALUNO", "NUMERO DO ALUNO NO CENSO", "MATRICULA", "CODIGO DO ALUNO"]) ||
+    findFieldValue(rawText, ["ID DO ALUNO", "ID ALUNO", "NUMERO DO ALUNO", "NUMERO DO ALUNO NO CENSO", "MATRICULA", "CODIGO DO ALUNO"], ["NOME DO ALUNO", "ALUNO", "DATA DE NASCIMENTO", "NASCIMENTO", "NACIONALIDADE", "NATURALIDADE", "IDENTIDADE", "RG", "PAI", "MAE"]) ||
+    findLabeledValue(lines, ["ID DO ALUNO", "ID ALUNO", "NUMERO DO ALUNO", "NUMERO DO ALUNO NO CENSO", "MATRICULA", "CODIGO DO ALUNO"]),
+  );
   const birthLine = normalizedLines.find((line) => line.includes("NASC")) || normalizedText;
   const birthDate = findFirstDate(valueRightOfLabel(words, ["DATA DE NASCIMENTO", "NASCIMENTO", "NASC"], ["NACIONALIDADE", "NATURALIDADE", "IDENTIDADE", "RG"]) || birthLine || "") || findBirthDate(rawText);
-  const naturalidade = valueRightOfLabel(words, ["NATURALIDADE", "NATURAL DE"], ["IDENTIDADE", "RG", "NOME DO PAI", "PAI", "NOME DA MAE", "MAE"]) || findFieldValue(rawText, ["NATURALIDADE", "NATURAL DE"], ["IDENTIDADE", "RG", "NACIONALIDADE", "PAI", "MAE"]) || findLabeledValue(lines, ["NATURALIDADE", "NATURAL DE"]);
-  const nacionalidade = valueRightOfLabel(words, ["NACIONALIDADE"], ["NATURALIDADE", "NATURAL DE", "IDENTIDADE", "RG"]) || findFieldValue(rawText, ["NACIONALIDADE"], ["NATURALIDADE", "NATURAL DE", "IDENTIDADE", "RG", "PAI", "MAE"]) || findLabeledValue(lines, ["NACIONALIDADE"]);
-  const identidade = valueRightOfLabel(words, ["IDENTIDADE", "RG"], ["NOME DO PAI", "PAI", "NOME DA MAE", "MAE"]) || findFieldValue(rawText, ["IDENTIDADE", "RG"], ["NOME DO PAI", "NOME DA MAE", "PAI", "MAE", "FILIAÇÃO", "FILIACAO"]) || findLabeledValue(lines, ["IDENTIDADE", "RG"]);
-  const father = valueRightOfLabel(words, ["NOME DO PAI", "PAI"], ["NOME DA MAE", "MAE", "DATA DE NASCIMENTO", "NASCIMENTO"]) || findFieldValue(rawText, ["NOME DO PAI", "PAI"], ["NOME DA MAE", "MAE", "DATA DE NASCIMENTO", "NASCIMENTO", "NACIONALIDADE", "NATURALIDADE"]) || findLabeledValue(lines, ["NOME DO PAI", "PAI"]);
-  const mother = valueRightOfLabel(words, ["NOME DA MAE", "MAE"], ["DATA DE NASCIMENTO", "NASCIMENTO", "NACIONALIDADE", "NATURALIDADE"]) || findFieldValue(rawText, ["NOME DA MAE", "MAE"], ["DATA DE NASCIMENTO", "NASCIMENTO", "NACIONALIDADE", "NATURALIDADE", "IDENTIDADE", "RG"]) || findLabeledValue(lines, ["NOME DA MAE", "MAE"]);
+  const naturalidade = valueRightOfLabel(words, ["NATURALIDADE", "NATURAL DE"], ["IDENTIDADE", "RG", "NOME DO PAI", "PAI", "NOME DA MAE", "MAE"]) || findLineFieldValue(lines, ["NATURALIDADE", "NATURAL DE"]) || findFieldValue(rawText, ["NATURALIDADE", "NATURAL DE"], ["IDENTIDADE", "RG", "NACIONALIDADE", "NOME DO PAI", "NOME DA MAE", "FILIAÇÃO", "FILIACAO", "PAI", "MAE"]) || findLabeledValue(lines, ["NATURALIDADE", "NATURAL DE"]);
+  const nacionalidade = valueRightOfLabel(words, ["NACIONALIDADE"], ["NATURALIDADE", "NATURAL DE", "IDENTIDADE", "RG"]) || findLineFieldValue(lines, ["NACIONALIDADE"]) || findFieldValue(rawText, ["NACIONALIDADE"], ["NATURALIDADE", "NATURAL DE", "IDENTIDADE", "RG", "PAI", "MAE"]) || findLabeledValue(lines, ["NACIONALIDADE"]);
+  const identidade = valueRightOfLabel(words, ["IDENTIDADE", "RG"], ["NOME DO PAI", "PAI", "NOME DA MAE", "MAE"]) || findLineFieldValue(lines, ["IDENTIDADE", "RG"]) || findFieldValue(rawText, ["IDENTIDADE", "RG"], ["NOME DO PAI", "NOME DA MAE", "PAI", "MAE", "FILIAÇÃO", "FILIACAO"]) || findLabeledValue(lines, ["IDENTIDADE", "RG"]);
+  const father = cleanOcrPerson(valueRightOfLabel(words, ["NOME DO PAI", "PAI"], ["NOME DA MAE", "MAE", "DATA DE NASCIMENTO", "NASCIMENTO"]) || findLineFieldValue(lines, ["NOME DO PAI", "PAI"]) || findFieldValue(rawText, ["NOME DO PAI", "PAI"], ["NOME DA MAE", "MAE", "DATA DE NASCIMENTO", "NASCIMENTO", "NACIONALIDADE", "NATURALIDADE"]) || findLabeledValue(lines, ["NOME DO PAI", "PAI"]));
+  const mother = cleanOcrPerson(valueRightOfLabel(words, ["NOME DA MAE", "MAE"], ["DATA DE NASCIMENTO", "NASCIMENTO", "NACIONALIDADE", "NATURALIDADE"]) || findLineFieldValue(lines, ["NOME DA MAE", "MAE"]) || findFieldValue(rawText, ["NOME DA MAE", "MAE"], ["DATA DE NASCIMENTO", "NASCIMENTO", "NACIONALIDADE", "NATURALIDADE", "IDENTIDADE", "RG"]) || findLabeledValue(lines, ["NOME DA MAE", "MAE"]));
 
   let notas = { ...record.notas };
   let resultados = { ...record.resultados };
@@ -1796,11 +2314,19 @@ function applyOcrTextToHistory(record: HistoryRecord, rawText: string, words: Oc
   for (const component of record.matriz) {
     const lineIndex = bestLineIndexForComponent(normalizedLines, component);
     if (lineIndex < 0) continue;
-    const labels = componentAliases[component.id] ?? [component.nome];
-    const values = noteValuesFromText(textAfterFirstLabel(normalizedLines.slice(lineIndex, lineIndex + 2).join(" "), labels));
-    if (!values.length) continue;
-    const explicitYear = explicitSchoolYearFromText(normalizedLines.slice(lineIndex, lineIndex + 2).join(" "));
-    if (explicitYear && explicitYear >= component.inicio && explicitYear <= component.fim) {
+    const labels = labelsForComponent(component);
+    const context = normalizedLines.slice(lineIndex, lineIndex + 2).join(" ");
+    const sourceText = textAfterFirstLabel(context, labels);
+    const pairs = yearValuePairsFromText(sourceText);
+    const values = noteValuesFromText(sourceText);
+    if (!pairs.length && !values.length) continue;
+    const explicitYear = explicitSchoolYearFromText(context);
+    if (pairs.length) {
+      notas[component.id] = { ...(notas[component.id] ?? {}) };
+      pairs.forEach(({ year, value }) => {
+        if (year >= component.inicio && year <= component.fim) notas[component.id][year] = value;
+      });
+    } else if (explicitYear && explicitYear >= component.inicio && explicitYear <= component.fim) {
       notas[component.id] = { ...(notas[component.id] ?? {}), [explicitYear]: values[0] };
     } else {
       assignComponentValues(notas, component, values);
@@ -1847,13 +2373,14 @@ function applyOcrTextToHistory(record: HistoryRecord, rawText: string, words: Oc
   const schoolYears = Array.from(new Set(Array.from(normalizedText.matchAll(/\b(?:19|20)\d{2}\b/g)).map((match) => match[0])))
     .filter((year) => year !== birthYear)
     .slice(0, 9);
-  const estudos = record.estudos.map((study, index) => ({
+  const filledStudies = fillStudiesFromText(record, normalizedLines, schoolDirectory);
+  const estudos = filledStudies.map((study, index) => ({
     ...study,
     ano: study.ano || schoolYears[index] || "",
   }));
 
-  const [naturalidadeCidade, naturalidadeEstado = record.aluno.naturalidadeEstado] = naturalidade
-    ? naturalidade.split(/[-/]/).map((part) => part.trim())
+  const [naturalidadeCidade, naturalidadeEstado] = naturalidade
+    ? splitNaturalidade(naturalidade, record.aluno.naturalidadeCidade, record.aluno.naturalidadeEstado)
     : [record.aluno.naturalidadeCidade, record.aluno.naturalidadeEstado];
 
   return {
@@ -1861,11 +2388,12 @@ function applyOcrTextToHistory(record: HistoryRecord, rawText: string, words: Oc
     aluno: {
       ...record.aluno,
       nome: studentName || record.aluno.nome,
+      idAluno: studentId || record.aluno.idAluno,
       nascimento: birthDate || record.aluno.nascimento,
       nacionalidade: nacionalidade || record.aluno.nacionalidade,
       naturalidadeCidade: naturalidadeCidade || record.aluno.naturalidadeCidade,
       naturalidadeEstado: naturalidadeEstado || record.aluno.naturalidadeEstado,
-      identidade: identidade || record.aluno.identidade,
+      identidade: identidade || record.aluno.identidade || "-",
       pai: father || record.aluno.pai,
       mae: mother || record.aluno.mae,
     },
@@ -1912,11 +2440,130 @@ const credeOptions = [
   "CREDE 20 - BREJO SANTO",
 ];
 
+const ptAlphabetical = new Intl.Collator("pt-BR", { sensitivity: "base", numeric: true });
+
+function compareText(a: string, b: string) {
+  return ptAlphabetical.compare(upper(a), upper(b));
+}
+
+function compareFolders(a: Folder, b: Folder) {
+  return compareText(a.nome, b.nome) || compareText(a.anoLetivo, b.anoLetivo);
+}
+
+function compareStudentRecords(a: HistoryRecord, b: HistoryRecord) {
+  return compareText(a.aluno.nome || a.codigo, b.aluno.nome || b.codigo)
+    || compareText(a.anoLetivo, b.anoLetivo)
+    || compareText(a.codigo, b.codigo);
+}
+
+function cloneMatrix(rows = matrixSeed) {
+  return rows.map((component) => ({ ...component }));
+}
+
+function cloneRecord<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function normalizeMatrixRows(rows?: ComponentRow[] | null): ComponentRow[] {
+  const source = rows?.length ? rows : matrixSeed;
+  return source.map((component, index) => {
+    const inicio = Math.min(9, Math.max(1, Number(component.inicio) || 1));
+    const fim = Math.min(9, Math.max(inicio, Number(component.fim) || 9));
+    return {
+      id: component.id || `disciplina-${index + 1}`,
+      area: component.area || "Parte Diversificada",
+      nome: uppercaseInput(component.nome || ""),
+      inicio,
+      fim,
+      avaliativo: component.avaliativo ?? true,
+    };
+  });
+}
+
+function normalizeNotesForMatrix(notes: HistoryRecord["notas"] | undefined, rows: ComponentRow[]) {
+  return rows.reduce<HistoryRecord["notas"]>((acc, component) => {
+    acc[component.id] = years.reduce<Record<number, string>>((row, year) => {
+      row[year] = normalizeNoteInput(notes?.[component.id]?.[year] ?? "");
+      return row;
+    }, {});
+    return acc;
+  }, {});
+}
+
+function normalizeHexColor(value: string | undefined, fallback: string) {
+  const color = String(value ?? "").trim();
+  return /^#[0-9a-fA-F]{6}$/.test(color) ? color.toLocaleLowerCase("pt-BR") : fallback;
+}
+
+function normalizeModelColors(input?: Partial<HistoryModelColors> | null): HistoryModelColors {
+  return {
+    destaque: normalizeHexColor(input?.destaque, defaultModelColors.destaque),
+    apoio: normalizeHexColor(input?.apoio, defaultModelColors.apoio),
+    borda: normalizeHexColor(input?.borda, defaultModelColors.borda),
+  };
+}
+
+function normalizeModelTemplate(record: HistoryRecord, fallbackSchoolId = record.schoolId || ""): HistoryRecord {
+  const normalized = normalizeHistory(record, fallbackSchoolId, []);
+  const modeloCores = normalizeModelColors(record.modeloCores ?? normalized.modeloCores);
+  const matriz = normalizeMatrixRows(record.matriz?.length ? record.matriz : normalized.matriz);
+  const template: HistoryRecord = {
+    ...normalized,
+    id: "modelo-historico",
+    schoolId: fallbackSchoolId,
+    codigo: "MODELO",
+    folderId: "",
+    anoLetivo: "",
+    status: "Em preenchimento",
+    updatedAt: record.updatedAt || new Date().toISOString(),
+    modeloCores,
+    matriz,
+    notas: normalizeNotesForMatrix(record.notas, matriz),
+    notasNegritoAnos: { ...normalized.notasNegritoAnos },
+    resultados: { ...normalized.resultados },
+    cargaHoraria: cloneRecord(normalized.cargaHoraria),
+    estudos: normalized.estudos.map((row) => ({ ...row })),
+    certificado: { ...normalized.certificado },
+    observacoes: normalized.observacoes.length ? [...normalized.observacoes] : [""],
+    localData: { ...normalized.localData },
+    aluno: {
+      ...normalized.aluno,
+      nome: "",
+      idAluno: "",
+      nascimento: "",
+      identidade: "-",
+      pai: "",
+      paiNaoDeclarado: false,
+      mae: "",
+    },
+    fotosHistorico: undefined,
+  };
+  return template;
+}
+
+function normalizeModel(input?: Partial<HistoryModel> | null): HistoryModel {
+  const matriz = normalizeMatrixRows(input?.matriz);
+  const cores = normalizeModelColors(input?.cores ?? input?.template?.modeloCores);
+  return {
+    matriz,
+    cores,
+    template: input?.template ? { ...normalizeModelTemplate(input.template, input.template.schoolId), modeloCores: cores } : undefined,
+    updatedAt: input?.updatedAt,
+  };
+}
+
+function modelForSchool(data: AppData, schoolId?: string | null) {
+  if (!schoolId) return normalizeModel();
+  return normalizeModel(data.modelos?.[schoolId]);
+}
+
 function createAdminUser(input?: Partial<AdminUser>): AdminUser {
   return {
     id: input?.id || crypto.randomUUID(),
     nome: uppercaseInput(input?.nome?.trim() || ""),
     usuario: uppercaseInput(input?.usuario?.trim() || ""),
+    email: normalizeEmail(input?.email || ""),
+    cpf: formatCpf(input?.cpf || ""),
     senha: input?.senha?.trim() || "123456",
     crede: uppercaseInput(input?.crede?.trim() || "CREDE 20 - BREJO SANTO"),
     nivel: "gestao",
@@ -1926,11 +2573,18 @@ function createAdminUser(input?: Partial<AdminUser>): AdminUser {
   };
 }
 
-function createSchoolAccess(input?: Partial<SchoolAccess>): SchoolAccess {
+function normalizeSchoolAccessLevel(value?: string, fallback: SchoolAccessLevel = "secundario"): SchoolAccessLevel {
+  return value === "principal" ? "principal" : value === "secundario" ? "secundario" : fallback;
+}
+
+function createSchoolAccess(input?: Partial<SchoolAccess>, fallbackLevel: SchoolAccessLevel = "secundario"): SchoolAccess {
   return {
     id: input?.id || crypto.randomUUID(),
     usuario: uppercaseInput(input?.usuario?.trim() || ""),
+    email: normalizeEmail(input?.email || ""),
+    cpf: formatCpf(input?.cpf || ""),
     senha: input?.senha?.trim() || "123456",
+    nivel: normalizeSchoolAccessLevel(input?.nivel, fallbackLevel),
     mustChangePassword: input?.mustChangePassword ?? !input?.id,
     createdAt: input?.createdAt || new Date().toISOString(),
   };
@@ -1945,22 +2599,23 @@ function createSchoolAccount(input?: Partial<SchoolAccount> & { escola?: Partial
     id: input?.accessos?.[0]?.id || `${input?.id || "nova-escola"}-principal`,
     usuario,
     senha: input?.senha || "123456",
+    nivel: input?.accessos?.[0]?.nivel || "principal",
     mustChangePassword: input?.mustChangePassword ?? !input?.id,
     createdAt: input?.createdAt,
-  });
+  }, "principal");
   const accessos = input?.accessos?.length
     ? input.accessos.map((access, index) => createSchoolAccess({
         ...access,
         usuario: access.usuario || (index === 0 ? usuario : ""),
         senha: access.senha || (index === 0 ? input?.senha : "123456"),
-      }))
+      }, index === 0 ? "principal" : "secundario"))
     : [mainAccess];
   const primaryAccess = accessos[0] ?? mainAccess;
   return {
     id: input?.id || crypto.randomUUID(),
     usuario: primaryAccess.usuario,
     senha: primaryAccess.senha,
-    tipo: input?.tipo || "municipal",
+    tipo: normalizeSchoolKind(input?.tipo),
     ativo: input?.ativo ?? true,
     escola,
     createdAt: input?.createdAt || new Date().toISOString(),
@@ -2046,6 +2701,7 @@ function normalizeHistory(record: HistoryRecord, fallbackSchoolId = migratedScho
       estado: uppercaseInput(saved?.estado || ""),
     };
   });
+  const modeloCores = normalizeModelColors(source.modeloCores);
 
   return {
     ...source,
@@ -2055,19 +2711,23 @@ function normalizeHistory(record: HistoryRecord, fallbackSchoolId = migratedScho
     aluno: {
       ...studentDefaultsForSchool(defaultSchool),
       ...source.aluno,
+      idAluno: uppercaseInput(source.aluno?.idAluno || ""),
       nacionalidade: uppercaseInput(source.aluno?.nacionalidade || "BRASILEIRA"),
       naturalidadeCidade: uppercaseInput(source.aluno?.naturalidadeCidade || defaultSchool.municipio),
       naturalidadeEstado: uppercaseInput(source.aluno?.naturalidadeEstado || defaultSchool.estado),
+      identidade: uppercaseInput(source.aluno?.identidade || "-"),
       pai: source.aluno?.paiNaoDeclarado ? "" : uppercaseInput(source.aluno?.pai || ""),
       paiNaoDeclarado: Boolean(source.aluno?.paiNaoDeclarado),
       mae: uppercaseInput(source.aluno?.mae || ""),
     },
+    modeloCores,
     notasNegritoAnos,
     resultados,
     certificado,
     usarCarimboEscola: Boolean(source.usarCarimboEscola),
     usarAssinaturaDiretor: Boolean(source.usarAssinaturaDiretor),
     usarAssinaturaSecretario: Boolean(source.usarAssinaturaSecretario),
+    usarQrCode: source.usarQrCode !== false,
     observacoes,
     estudos,
     localData: {
@@ -2078,7 +2738,12 @@ function normalizeHistory(record: HistoryRecord, fallbackSchoolId = migratedScho
     matriz: [
       ...matrixSeed.map((component) => {
         const saved = record.matriz?.find((row) => row.id === component.id);
-        return { ...component, ...saved, nome: component.nome, area: component.area };
+        return {
+          ...component,
+          ...saved,
+          nome: uppercaseInput(saved?.nome || component.nome),
+          area: saved?.area || component.area,
+        };
       }),
       ...savedExtraComponents.map((component) => ({
         ...component,
@@ -2093,7 +2758,7 @@ function normalizeHistory(record: HistoryRecord, fallbackSchoolId = migratedScho
 
 function loadInitialData(): AppData {
   if (typeof window === "undefined") {
-    return { escola: defaultSchool, escolas: [], folders: [], historicos: [], transferencias: [], admin: null, adminUsers: [] };
+    return { escola: defaultSchool, escolas: [], folders: [], historicos: [], transferencias: [], admin: null, adminUsers: [], modelos: {} };
   }
   const saved = window.localStorage.getItem(storageKey);
   if (saved) {
@@ -2123,13 +2788,14 @@ function loadInitialData(): AppData {
           transferencias: parsed.transferencias ?? [],
           admin: parsed.admin ?? null,
           adminUsers: (parsed.adminUsers ?? []).map(createAdminUser),
+          modelos: Object.fromEntries(Object.entries(parsed.modelos ?? {}).map(([schoolId, model]) => [schoolId, normalizeModel(model)])),
         };
       }
     } catch {
       window.localStorage.removeItem(storageKey);
     }
   }
-  return { escola: defaultSchool, escolas: [], folders: [], historicos: [], transferencias: [], admin: null, adminUsers: [] };
+  return { escola: defaultSchool, escolas: [], folders: [], historicos: [], transferencias: [], admin: null, adminUsers: [], modelos: {} };
 }
 
 function loadAdminCredentials() {
@@ -2138,7 +2804,14 @@ function loadAdminCredentials() {
   if (!saved) return null;
   try {
     const parsed = JSON.parse(saved) as AdminCredentials;
-    return parsed.usuario && parsed.senha ? parsed : null;
+    return parsed.usuario && parsed.senha ? {
+      ...parsed,
+      nome: uppercaseInput(parsed.nome || parsed.usuario),
+      usuario: uppercaseInput(parsed.usuario),
+      email: normalizeEmail(parsed.email || ""),
+      cpf: formatCpf(parsed.cpf || ""),
+      mustChangePassword: Boolean(parsed.mustChangePassword),
+    } : null;
   } catch {
     window.localStorage.removeItem(adminStorageKey);
     return null;
@@ -2184,6 +2857,7 @@ function normalizeLoadedData(cloudData: AppData, cloudHistories: HistoryRecord[]
     historicos: Array.from(new Map(combinedHistories.map((record) => [record.id, normalizeHistory(record, record.schoolId || firstSchoolId, folders)])).values()),
     admin: cloudData.admin ?? null,
     adminUsers: (cloudData.adminUsers ?? []).map(createAdminUser),
+    modelos: Object.fromEntries(Object.entries(cloudData.modelos ?? {}).map(([schoolId, model]) => [schoolId, normalizeModel(model)])),
   };
 }
 
@@ -2194,6 +2868,13 @@ function cloudReadyData(data: AppData): AppData {
       const { fotosHistorico: _photos, ...cleanRecord } = record;
       return cleanRecord;
     }),
+  };
+}
+
+function cloudReadySystemData(data: AppData): AppData {
+  return {
+    ...cloudReadyData(data),
+    historicos: [],
   };
 }
 
@@ -2210,8 +2891,19 @@ function saveFailureState(error: unknown) {
   return "Salvo";
 }
 
+function SaveToast({ notice, onClose }: { notice: SaveNotice | null; onClose: () => void }) {
+  if (!notice) return null;
+  return (
+    <div className={`save-toast ${notice.type}`} role="status" aria-live="polite">
+      <span>{notice.type === "success" ? "OK" : "!"}</span>
+      <strong>{notice.message}</strong>
+      <button type="button" onClick={onClose} aria-label="Fechar aviso">×</button>
+    </div>
+  );
+}
+
 function App() {
-  const [data, setData] = useState<AppData>({ escola: defaultSchool, escolas: [], folders: [], historicos: [], transferencias: [], admin: null, adminUsers: [] });
+  const [data, setData] = useState<AppData>({ escola: defaultSchool, escolas: [], folders: [], historicos: [], transferencias: [], admin: null, adminUsers: [], modelos: {} });
   const [auth, setAuth] = useState<AuthSession | null>(null);
   const [adminCredentials, setAdminCredentials] = useState<AdminCredentials | null>(null);
   const [cloudHasAdmin, setCloudHasAdmin] = useState(false);
@@ -2220,17 +2912,23 @@ function App() {
   const [folderDraft, setFolderDraft] = useState("");
   const [folderYearDraft, setFolderYearDraft] = useState(String(new Date().getFullYear()));
   const [folderTeachingDraft, setFolderTeachingDraft] = useState("ENSINO FUNDAMENTAL");
-  const [view, setView] = useState<"historicos" | "editor" | "escola" | "turmas" | "alunos" | "novo" | "transferencias">("historicos");
+  const [view, setView] = useState<"historicos" | "editor" | "escola" | "turmas" | "alunos" | "novo" | "transferencias" | "modelo">("historicos");
   const [yearFilter, setYearFilter] = useState("");
   const [step, setStep] = useState(0);
   const [query, setQuery] = useState("");
-  const [zoom, setZoom] = useState(0.42);
+  const [zoom, setZoom] = useState(0.36);
   const [page, setPage] = useState<1 | 2>(1);
+  const [previewCollapsed, setPreviewCollapsed] = useState(false);
   const [saveState, setSaveState] = useState("Salvo");
+  const [saveNotice, setSaveNotice] = useState<SaveNotice | null>(null);
   const [duplicate, setDuplicate] = useState<HistoryRecord | null>(null);
   const [printBatch, setPrintBatch] = useState<HistoryRecord[] | null>(null);
   const [isReady, setIsReady] = useState(false);
+  const [activity, setActivity] = useState<{ activeUsers: CloudActiveUser[]; activities: CloudActivity[] }>({ activeUsers: [], activities: [] });
   const saveTimer = useRef<number | null>(null);
+  const noticeTimer = useRef<number | null>(null);
+  const qrHandledRef = useRef("");
+  const dataRef = useRef(data);
 
   const currentSchoolAccount = auth?.role === "school"
     ? data.escolas.find((school) => school.id === auth.schoolId)
@@ -2241,18 +2939,20 @@ function App() {
   const currentSchoolAccesses = currentSchoolAccount?.accessos?.length
     ? currentSchoolAccount.accessos
     : currentSchoolAccount
-      ? [createSchoolAccess({ usuario: currentSchoolAccount.usuario, senha: currentSchoolAccount.senha, mustChangePassword: currentSchoolAccount.mustChangePassword })]
+      ? [createSchoolAccess({ usuario: currentSchoolAccount.usuario, senha: currentSchoolAccount.senha, nivel: "principal", mustChangePassword: currentSchoolAccount.mustChangePassword }, "principal")]
       : [];
   const currentSchoolAccess = currentSchoolAccesses.find((access) => access.id === auth?.accessId)
     ?? currentSchoolAccesses.find((access) => access.usuario === auth?.nome)
     ?? currentSchoolAccesses[0];
+  const canEditHistoryModel = currentSchoolAccess?.nivel === "principal" || auth?.accessLevel === "principal";
   const currentSchool = currentSchoolAccount?.escola ?? defaultSchool;
+  const currentModel = useMemo(() => modelForSchool(data, currentSchoolAccount?.id), [data.modelos, currentSchoolAccount?.id]);
   const schoolProfileReady = currentSchoolAccount ? isSchoolProfileReady(currentSchool) : false;
   const schoolFolders = currentSchoolAccount
-    ? data.folders.filter((folder) => folder.schoolId === currentSchoolAccount.id)
+    ? data.folders.filter((folder) => folder.schoolId === currentSchoolAccount.id).sort(compareFolders)
     : [];
   const schoolRecords = currentSchoolAccount
-    ? data.historicos.filter((record) => record.schoolId === currentSchoolAccount.id)
+    ? data.historicos.filter((record) => record.schoolId === currentSchoolAccount.id).sort(compareStudentRecords)
     : [];
   const active = schoolRecords.find((item) => item.id === activeId) ?? schoolRecords[0];
   const yearOptions = Array.from(new Set(schoolFolders.map((folder) => folder.anoLetivo).filter(Boolean))).sort().reverse();
@@ -2266,6 +2966,76 @@ function App() {
     ? data.transferencias.filter((request) => request.toSchoolId === currentSchoolAccount.id && request.status === "Enviado" && !request.hiddenForSchoolIds?.includes(currentSchoolAccount.id))
     : [];
   const schoolDirectory = useMemo(() => localSchoolDirectory(data.escolas, data.historicos), [data.escolas, data.historicos]);
+  const presenceLabel = (() => {
+    if (!auth) return "";
+    if (auth.role === "owner" || auth.role === "manager") {
+      if (view === "escola") return "Editando cadastro de escola";
+      return "No painel restrito";
+    }
+    if (view === "editor") return "Editando histórico";
+    if (view === "modelo") return "Editando modelo do histórico";
+    if (view === "novo") return "Criando histórico";
+    if (view === "turmas") return "Criando ou consultando turmas";
+    if (view === "alunos") return "Consultando alunos";
+    if (view === "transferencias") return "Consultando transferências";
+    if (view === "escola") return "Editando cadastro da escola";
+    return "Consultando históricos";
+  })();
+  const presenceTarget = auth?.role === "school" && view === "editor" && active
+    ? upper(active.aluno.nome) || active.codigo
+    : "";
+  const showSaveNotice = (message: string, type: SaveNotice["type"] = "success") => {
+    setSaveNotice({ message, type });
+    if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
+    noticeTimer.current = window.setTimeout(() => setSaveNotice(null), type === "error" ? 5200 : 3400);
+  };
+  const screenWithNotice = (content: ReactNode) => (
+    <>
+      {content}
+      <SaveToast notice={saveNotice} onClose={() => setSaveNotice(null)} />
+    </>
+  );
+
+  useEffect(() => {
+    dataRef.current = data;
+  }, [data]);
+
+  const refreshActivity = async () => {
+    if (!firebaseEnabled || !auth || (auth.role !== "owner" && auth.role !== "manager")) return;
+    const nextActivity = await loadCloudActivity();
+    setActivity(nextActivity);
+  };
+
+  const recordAction = (tipo: string, descricao: string, details: { schoolId?: string; schoolName?: string; targetId?: string; targetName?: string } = {}) => {
+    if (!firebaseEnabled || !auth) return;
+    if (auth.role === "owner") return;
+    if (["LOGIN", "SAIDA", "SENHA"].includes(tipo)) return;
+    void recordCloudActivity({
+      tipo,
+      descricao,
+      schoolId: details.schoolId || auth.schoolId || "",
+      schoolName: details.schoolName || currentSchoolAccount?.escola.nome || "",
+      targetId: details.targetId || "",
+      targetName: details.targetName || "",
+    }).then(() => {
+      if (auth.role === "owner" || auth.role === "manager") void refreshActivity();
+    });
+  };
+
+  const deleteActivity = async (id?: string) => {
+    if (!firebaseEnabled || !auth || (auth.role !== "owner" && auth.role !== "manager")) return;
+    if (!id && !window.confirm("Apagar todas as ações recentes?")) return;
+    const deleted = await deleteCloudActivity(id ? { id } : { all: true });
+    if (!deleted) {
+      window.alert("Não foi possível apagar agora.");
+      return;
+    }
+    setActivity((current) => ({
+      ...current,
+      activities: id ? current.activities.filter((item) => item.id !== id) : [],
+    }));
+    showSaveNotice(id ? "Ação apagada" : "Ações apagadas");
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -2292,9 +3062,16 @@ function App() {
           }
         } catch (error) {
           console.error("Nao foi possivel carregar os dados.", error);
+          if (session?.sessionToken) {
+            activeSession = null;
+            storeAuthSession(null);
+          } else {
+            setCloudHasAdmin(true);
+          }
         }
       }
       if (cancelled) return;
+      dataRef.current = initialData;
       setData(initialData);
       setAdminCredentials(initialData.admin ?? loadAdminCredentials());
       setAuth(activeSession);
@@ -2318,9 +3095,34 @@ function App() {
       if (view !== "escola") setView("escola");
       return;
     }
+    if (view === "modelo" && !canEditHistoryModel) {
+      setView("historicos");
+      return;
+    }
     if (!activeId && schoolRecords[0]) setActiveId(schoolRecords[0].id);
-    if (!schoolFolders.length && !["escola", "turmas", "novo"].includes(view)) setView("historicos");
-  }, [auth, currentSchoolAccount, schoolProfileReady, activeId, schoolRecords, schoolFolders.length, view]);
+    if (!schoolFolders.length && !["escola", "turmas", "novo", "modelo"].includes(view)) setView("historicos");
+  }, [auth, currentSchoolAccount, schoolProfileReady, canEditHistoryModel, activeId, schoolRecords, schoolFolders.length, view]);
+
+  useEffect(() => {
+    if (!isReady || auth?.role !== "school" || typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    const qrId = params.get("h") || params.get("q") || params.get("historicoQr") || params.get("historico") || params.get("id");
+    const qrCode = params.get("c") || params.get("codigo") || "";
+    if (!qrId || qrHandledRef.current === qrId) return;
+    if (!schoolRecords.length) return;
+    const found = schoolRecords.find((record) => record.id === qrId || record.codigo === qrCode);
+    if (!found) {
+      setSaveState("QR nao encontrado nesta escola");
+      return;
+    }
+    qrHandledRef.current = qrId;
+    setActiveId(found.id);
+    setView("editor");
+    setStep(6);
+    setPage(1);
+    setSaveState("Historico aberto pelo QR");
+    window.history.replaceState(null, "", window.location.pathname);
+  }, [isReady, auth?.role, schoolRecords]);
 
   useEffect(() => {
     if (!isReady) return;
@@ -2332,7 +3134,11 @@ function App() {
         setSaveState("Salvo");
         return;
       }
-      void saveCloudState(cloudReadyData(data))
+      if (!auth?.sessionToken) {
+        setSaveState("Salvo");
+        return;
+      }
+      void saveCloudState(cloudReadySystemData(data))
         .then((stateSaved) => {
           if (!stateSaved) throw new Error("Falha ao salvar dados.");
           return saveCloudHistories(data.historicos.map(cloudReadyHistory));
@@ -2346,7 +3152,30 @@ function App() {
           setSaveState(saveFailureState(error));
         });
     }, 700);
-  }, [data, isReady]);
+  }, [data, isReady, auth?.sessionToken]);
+
+  useEffect(() => {
+    if (!isReady || !auth || !firebaseEnabled) return;
+    const sendPresence = () => {
+      void pingCloudActivity({
+        currentView: view,
+        actionLabel: presenceLabel,
+        targetId: view === "editor" ? active?.id : "",
+        targetName: presenceTarget,
+        schoolName: currentSchoolAccount?.escola.nome || "",
+      });
+    };
+    sendPresence();
+    const timer = window.setInterval(sendPresence, 35000);
+    return () => window.clearInterval(timer);
+  }, [isReady, auth, view, presenceLabel, presenceTarget, active?.id, currentSchoolAccount?.escola.nome]);
+
+  useEffect(() => {
+    if (!isReady || !auth || (auth.role !== "owner" && auth.role !== "manager") || !firebaseEnabled) return;
+    void refreshActivity();
+    const timer = window.setInterval(() => void refreshActivity(), 25000);
+    return () => window.clearInterval(timer);
+  }, [isReady, auth]);
 
   useEffect(() => {
     const clearPrintBatch = () => setPrintBatch(null);
@@ -2367,19 +3196,31 @@ function App() {
         formatDate(record.aluno.nascimento).includes(needle) ||
         record.codigo.toLocaleLowerCase("pt-BR").includes(needle))
     );
-  });
+  }).sort(compareStudentRecords);
 
   const updateSchool = (patch: Partial<School>) => {
     if (auth?.role !== "school" || !auth.schoolId) {
       window.alert("Entre com o login da escola para alterar os dados cadastrais.");
       return;
     }
-    setData((current) => ({
-      ...current,
-      escolas: current.escolas.map((account) =>
-        account.id === auth.schoolId ? { ...account, escola: { ...account.escola, ...patch } } : account,
-      ),
-    }));
+    const shouldSaveImageNow = Object.entries(patch).some(([key, value]) =>
+      schoolImageKeys.includes(key as SchoolImageKey) &&
+      typeof value === "string" &&
+      (value === "" || value.startsWith("data:image/"))
+    );
+    setData((current) => {
+      const nextData = {
+        ...current,
+        escolas: current.escolas.map((account) =>
+          account.id === auth.schoolId ? { ...account, escola: { ...account.escola, ...patch } } : account,
+        ),
+      };
+      dataRef.current = nextData;
+      if (shouldSaveImageNow) {
+        window.setTimeout(() => void persistData(nextData, "Imagem da escola salva", { saveHistories: false }), 0);
+      }
+      return nextData;
+    });
   };
 
   const applyCloudLogin = (payload: AppData, session: AuthSession, histories?: HistoryRecord[]) => {
@@ -2399,8 +3240,12 @@ function App() {
 
   const createAdminAccess = async (credentials: AdminCredentials) => {
     const clean = {
+      nome: uppercaseInput((credentials.nome || credentials.usuario).trim()),
       usuario: uppercaseInput(credentials.usuario.trim()),
+      email: normalizeEmail(credentials.email || ""),
+      cpf: formatCpf(credentials.cpf || ""),
       senha: credentials.senha.trim(),
+      mustChangePassword: false,
     };
     if (!clean.usuario || !clean.senha) {
       window.alert("Informe usuario e senha.");
@@ -2413,7 +3258,18 @@ function App() {
         return;
       } catch (error) {
         console.error("Falha ao criar acesso restrito.", error);
-        window.alert("Não foi possível criar o acesso restrito agora.");
+        const code = String((error as { code?: string })?.code ?? "");
+        if (code.includes("already-exists")) {
+          setCloudHasAdmin(true);
+          try {
+            const result = await loginCloudAdmin<AppData>(clean);
+            applyCloudLogin(result.payload, result.session, result.histories as HistoryRecord[] | undefined);
+          } catch {
+            window.alert("O acesso restrito já existe. Entre com o usuário e a senha cadastrados.");
+          }
+          return;
+        }
+        window.alert("Não foi possível acessar o banco agora. Tente novamente em instantes.");
         return;
       }
     }
@@ -2443,7 +3299,7 @@ function App() {
       }
     }
     if (usuario === adminCredentials.usuario && senha === adminCredentials.senha) {
-      const session = { role: "owner" as const, nome: usuario };
+      const session = { role: "owner" as const, nome: adminCredentials.nome || usuario };
       setAuth(session);
       storeAuthSession(session);
       return;
@@ -2458,12 +3314,67 @@ function App() {
     storeAuthSession(session);
   };
 
-  const changeAdminPassword = (currentPassword: string, nextPassword: string, confirmation: string) => {
+  const recoverSchoolPassword = async (input: { usuario: string; email: string; cpf: string; tipo: SchoolKind }) => {
+    const usuario = uppercaseInput(input.usuario.trim());
+    const email = normalizeEmail(input.email);
+    const cpf = formatCpf(input.cpf);
+    if (!usuario || !email || digitsOnly(cpf).length !== 11) {
+      window.alert("Informe Login, E-mail e CPF cadastrados.");
+      return false;
+    }
+    if (firebaseEnabled) {
+      try {
+        const recovered = await recoverCloudSchoolPassword({ usuario, email, cpf, tipo: input.tipo });
+        if (!recovered) throw new Error("Falha ao recuperar senha.");
+      } catch (error) {
+        console.error("Falha ao recuperar senha.", error);
+        window.alert("Não encontramos um acesso ativo da escola com esses dados.");
+        return false;
+      }
+      showSaveNotice("Senha provisória liberada com sucesso");
+      return true;
+    }
+    const foundSchool = data.escolas.find((account) =>
+      account.ativo !== false &&
+      account.tipo === input.tipo &&
+      account.accessos.some((access) =>
+        access.usuario === usuario &&
+        normalizeEmail(access.email) === email &&
+        digitsOnly(access.cpf) === digitsOnly(cpf)
+      )
+    );
+    const foundAccess = foundSchool?.accessos.find((access) =>
+      access.usuario === usuario &&
+      normalizeEmail(access.email) === email &&
+      digitsOnly(access.cpf) === digitsOnly(cpf)
+    );
+    if (!foundSchool || !foundAccess) {
+      window.alert("Não encontramos um acesso ativo da escola com esses dados.");
+      return false;
+    }
+    const nextData = {
+      ...data,
+      escolas: data.escolas.map((account) => {
+        if (account.id !== foundSchool.id) return account;
+        const accessos = account.accessos.map((access) =>
+          access.id === foundAccess.id ? { ...access, senha: "123456", mustChangePassword: true } : access,
+        );
+        const primaryAccess = accessos[0] ?? createSchoolAccess({ usuario: account.usuario, senha: account.senha }, "principal");
+        return { ...account, accessos, senha: primaryAccess.senha, mustChangePassword: primaryAccess.mustChangePassword };
+      }),
+    };
+    setData(nextData);
+    void persistData(nextData, "Senha provisória liberada");
+    showSaveNotice("Senha provisória liberada com sucesso");
+    return true;
+  };
+
+  const changeAdminPassword = async (currentPassword: string, nextPassword: string, confirmation: string) => {
     if (!adminCredentials) {
       window.alert("Acesso restrito nao localizado.");
       return false;
     }
-    if (currentPassword.trim() !== adminCredentials.senha) {
+    if (!firebaseEnabled && currentPassword.trim() !== adminCredentials.senha) {
       window.alert("Senha atual incorreta.");
       return false;
     }
@@ -2480,7 +3391,17 @@ function App() {
       window.alert("Informe uma senha diferente da atual.");
       return false;
     }
-    const nextAdmin = { ...adminCredentials, senha: cleanPassword };
+    if (firebaseEnabled) {
+      try {
+        const changed = await changeCloudPassword({ currentPassword, nextPassword: cleanPassword });
+        if (!changed) throw new Error("Falha ao alterar senha.");
+      } catch (error) {
+        console.error("Falha ao alterar senha.", error);
+        window.alert("Senha atual incorreta ou não foi possível alterar agora.");
+        return false;
+      }
+    }
+    const nextAdmin = { ...adminCredentials, senha: cleanPassword, mustChangePassword: false };
     window.localStorage.setItem(adminStorageKey, JSON.stringify(nextAdmin));
     setAdminCredentials(nextAdmin);
     const nextData = { ...data, admin: nextAdmin };
@@ -2489,13 +3410,33 @@ function App() {
     return true;
   };
 
-  const changeManagerFirstPassword = (password: string) => {
-    if (auth?.role !== "manager" || !auth.adminUserId) return;
+  const changeRestrictedFirstPassword = async (password: string) => {
+    if (!auth || (auth.role !== "owner" && auth.role !== "manager")) return;
     const cleanPassword = password.trim();
     if (cleanPassword.length < 6 || cleanPassword === "123456") {
       window.alert("Crie uma senha com pelo menos 6 caracteres e diferente da senha provisoria.");
       return;
     }
+    if (firebaseEnabled) {
+      try {
+        const changed = await changeCloudPassword({ nextPassword: cleanPassword, firstAccess: true });
+        if (!changed) throw new Error("Falha ao alterar senha.");
+      } catch (error) {
+        console.error("Falha ao alterar senha.", error);
+        window.alert("Não foi possível alterar a senha agora.");
+        return;
+      }
+    }
+    if (auth.role === "owner") {
+      const nextAdmin = { ...(adminCredentials ?? { usuario: auth.nome, senha: "" }), senha: cleanPassword, mustChangePassword: false };
+      window.localStorage.setItem(adminStorageKey, JSON.stringify(nextAdmin));
+      setAdminCredentials(nextAdmin);
+      const nextData = { ...data, admin: nextAdmin };
+      setData(nextData);
+      void persistData(nextData, "Senha alterada");
+      return;
+    }
+    if (!auth.adminUserId) return;
     const nextData = {
       ...data,
       adminUsers: (data.adminUsers ?? []).map((user) => user.id === auth.adminUserId
@@ -2506,7 +3447,7 @@ function App() {
     void persistData(nextData, "Senha alterada");
   };
 
-  const changeRestrictedOwnPassword = (currentPassword: string, nextPassword: string, confirmation: string) => {
+  const changeRestrictedOwnPassword = async (currentPassword: string, nextPassword: string, confirmation: string) => {
     if (auth?.role === "owner") return changeAdminPassword(currentPassword, nextPassword, confirmation);
     if (auth?.role !== "manager" || !auth.adminUserId) {
       window.alert("Acesso restrito nao localizado.");
@@ -2517,7 +3458,7 @@ function App() {
       window.alert("Acesso restrito nao localizado.");
       return false;
     }
-    if (currentPassword.trim() !== user.senha) {
+    if (!firebaseEnabled && currentPassword.trim() !== user.senha) {
       window.alert("Senha atual incorreta.");
       return false;
     }
@@ -2534,6 +3475,16 @@ function App() {
       window.alert("Informe uma senha diferente da atual.");
       return false;
     }
+    if (firebaseEnabled) {
+      try {
+        const changed = await changeCloudPassword({ currentPassword, nextPassword: cleanPassword });
+        if (!changed) throw new Error("Falha ao alterar senha.");
+      } catch (error) {
+        console.error("Falha ao alterar senha.", error);
+        window.alert("Senha atual incorreta ou não foi possível alterar agora.");
+        return false;
+      }
+    }
     const nextData = {
       ...data,
       adminUsers: (data.adminUsers ?? []).map((item) => item.id === auth.adminUserId
@@ -2545,11 +3496,54 @@ function App() {
     return true;
   };
 
+  const updateRestrictedProfile = async (profile: { nome: string; email: string; cpf: string }) => {
+    if (!auth || (auth.role !== "owner" && auth.role !== "manager")) return false;
+    const cleanName = uppercaseInput(profile.nome.trim());
+    const cleanEmail = normalizeEmail(profile.email);
+    const cleanCpf = formatCpf(profile.cpf);
+    if (!cleanName) {
+      window.alert("Informe o nome que deve aparecer no sistema.");
+      return false;
+    }
+    if (cleanEmail && digitsOnly(cleanCpf).length !== 11) {
+      window.alert("Informe um CPF valido para recuperação de senha.");
+      return false;
+    }
+    if (firebaseEnabled) {
+      try {
+        const cloudName = await updateCloudProfile({ nome: cleanName, email: cleanEmail, cpf: cleanCpf });
+        if (!cloudName) throw new Error("Falha ao atualizar perfil.");
+      } catch (error) {
+        console.error("Falha ao atualizar perfil.", error);
+        window.alert("Não foi possível atualizar o perfil agora.");
+        return false;
+      }
+    }
+    const nextAuth = { ...auth, nome: cleanName };
+    setAuth(nextAuth);
+    storeAuthSession(nextAuth);
+    if (auth.role === "owner") {
+      const nextAdmin = { ...(adminCredentials ?? { usuario: auth.nome, senha: "" }), nome: cleanName, email: cleanEmail, cpf: cleanCpf };
+      setAdminCredentials(nextAdmin);
+      const nextData = { ...data, admin: nextAdmin };
+      setData(nextData);
+      void persistData(nextData, "Perfil atualizado");
+      return true;
+    }
+    const nextData = {
+      ...data,
+      adminUsers: (data.adminUsers ?? []).map((item) => item.id === auth.adminUserId ? { ...item, nome: cleanName, email: cleanEmail, cpf: cleanCpf } : item),
+    };
+    setData(nextData);
+    void persistData(nextData, "Perfil atualizado");
+    return true;
+  };
+
   const createRestrictedAccess = (input: AdminUser) => {
     if (auth?.role !== "owner") return;
     const clean = createAdminUser({ ...input, mustChangePassword: true });
-    if (!clean.nome || !clean.usuario || !clean.senha) {
-      window.alert("Informe nome, usuario e senha.");
+    if (!clean.nome || !clean.usuario || !clean.email || digitsOnly(clean.cpf).length !== 11 || !clean.senha) {
+      window.alert("Informe nome, usuario, e-mail, CPF e senha.");
       return false;
     }
     const nextUsers = [...(data.adminUsers ?? []), clean];
@@ -2560,6 +3554,7 @@ function App() {
     const nextData = { ...data, adminUsers: nextUsers };
     setData(nextData);
     void persistData(nextData, "Acesso criado");
+    recordAction("ACESSO", `Criou o acesso restrito de ${upper(clean.nome || clean.usuario)}.`, { targetId: clean.id, targetName: clean.nome || clean.usuario });
     return true;
   };
 
@@ -2573,6 +3568,13 @@ function App() {
     const nextData = { ...data, adminUsers: nextUsers };
     setData(nextData);
     void persistData(nextData, "Acesso atualizado");
+    if (patch.ativo !== undefined || patch.senha !== undefined) {
+      const user = nextUsers.find((item) => item.id === id);
+      const description = patch.senha !== undefined
+        ? `Redefiniu a senha de ${upper(user?.nome || user?.usuario || "")}.`
+        : `${patch.ativo === false ? "Bloqueou" : "Liberou"} o acesso de ${upper(user?.nome || user?.usuario || "")}.`;
+      recordAction("ACESSO", description, { targetId: id, targetName: user?.nome || user?.usuario || "" });
+    }
   };
 
   const deleteRestrictedAccess = (id: string) => {
@@ -2583,6 +3585,7 @@ function App() {
     const nextData = { ...data, adminUsers: (data.adminUsers ?? []).filter((item) => item.id !== id) };
     setData(nextData);
     void persistData(nextData, "Acesso excluido");
+    recordAction("ACESSO", `Excluiu o acesso restrito de ${upper(name)}.`, { targetId: id, targetName: name });
   };
 
   const loginSchool = async (credentials: SchoolLoginCredentials) => {
@@ -2604,7 +3607,7 @@ function App() {
       if (account.tipo !== credentials.tipo) return false;
       const accessos = account.accessos?.length
         ? account.accessos
-        : [createSchoolAccess({ usuario: account.usuario, senha: account.senha, mustChangePassword: account.mustChangePassword })];
+        : [createSchoolAccess({ usuario: account.usuario, senha: account.senha, nivel: "principal", mustChangePassword: account.mustChangePassword }, "principal")];
       return accessos.some((access) => access.usuario === usuario && access.senha === senha);
     });
     if (!school) {
@@ -2613,11 +3616,11 @@ function App() {
     }
     const schoolAccesses = school.accessos?.length
       ? school.accessos
-      : [createSchoolAccess({ usuario: school.usuario, senha: school.senha, mustChangePassword: school.mustChangePassword })];
+      : [createSchoolAccess({ usuario: school.usuario, senha: school.senha, nivel: "principal", mustChangePassword: school.mustChangePassword }, "principal")];
     const access = schoolAccesses.find((item) => item.usuario === usuario && item.senha === senha)
       ?? schoolAccesses[0]
-      ?? createSchoolAccess({ usuario: school.usuario, senha: school.senha, mustChangePassword: school.mustChangePassword });
-    const session = { role: "school" as const, nome: access.usuario, schoolId: school.id, accessId: access.id };
+      ?? createSchoolAccess({ usuario: school.usuario, senha: school.senha, nivel: "principal", mustChangePassword: school.mustChangePassword }, "principal");
+    const session = { role: "school" as const, nome: access.usuario, schoolId: school.id, accessId: access.id, accessLevel: access.nivel };
     setAuth(session);
     setActiveFolderId("");
     setActiveId(data.historicos.find((record) => record.schoolId === school.id)?.id ?? "");
@@ -2641,6 +3644,7 @@ function App() {
 
   const createSchoolAccountFromAdmin = (account: SchoolAccount) => {
     const createdId = account.id || crypto.randomUUID();
+    const primaryInput = account.accessos[0];
     const clean = createSchoolAccount({
       ...account,
       id: createdId,
@@ -2650,9 +3654,12 @@ function App() {
         createSchoolAccess({
           id: `${createdId}-principal`,
           usuario: account.usuario,
+          email: primaryInput?.email || "",
+          cpf: primaryInput?.cpf || "",
           senha: account.senha,
+          nivel: "principal",
           mustChangePassword: true,
-        }),
+        }, "principal"),
       ],
       escola: {
         ...account.escola,
@@ -2661,6 +3668,10 @@ function App() {
     });
     if (!clean.usuario || !clean.senha || !clean.escola.nome) {
       window.alert("Informe nome da escola, cidade, estado, usuario e senha.");
+      return;
+    }
+    if (!clean.accessos[0]?.email || digitsOnly(clean.accessos[0]?.cpf || "").length !== 11) {
+      window.alert("Informe e-mail e CPF do acesso da escola.");
       return;
     }
     if (!clean.escola.municipio || !clean.escola.estado) {
@@ -2674,16 +3685,19 @@ function App() {
     }
     setData((current) => ({ ...current, escolas: nextSchools }));
     setSaveState("Escola cadastrada");
+    showSaveNotice("Escola cadastrada com sucesso");
+    recordAction("ESCOLA", `Cadastrou a escola ${upper(clean.escola.nome)}.`, { schoolId: clean.id, schoolName: clean.escola.nome, targetId: clean.id, targetName: clean.escola.nome });
   };
 
   const updateSchoolAccountFromAdmin = (id: string, patch: Partial<SchoolAccount> & { escola?: Partial<School> }) => {
+    const before = data.escolas.find((account) => account.id === id);
     const nextSchools = data.escolas.map((account) => {
       if (account.id !== id) return account;
       const patchedAccessos = patch.accessos
-        ? patch.accessos.map(createSchoolAccess).filter((access) => access.usuario)
+        ? patch.accessos.map((access, index) => createSchoolAccess(access, index === 0 ? "principal" : "secundario")).filter((access) => access.usuario)
         : account.accessos;
       const accessos = patchedAccessos.length ? patchedAccessos : account.accessos;
-      const primaryAccess = accessos[0] ?? createSchoolAccess({ usuario: account.usuario, senha: account.senha, mustChangePassword: account.mustChangePassword });
+      const primaryAccess = accessos[0] ?? createSchoolAccess({ usuario: account.usuario, senha: account.senha, nivel: "principal", mustChangePassword: account.mustChangePassword }, "principal");
       return {
         ...account,
         ...patch,
@@ -2699,14 +3713,36 @@ function App() {
       return;
     }
     setData((current) => ({ ...current, escolas: nextSchools }));
+    setSaveState("Escola atualizada");
+    showSaveNotice("Escola atualizada com sucesso");
+    if (before) {
+      const after = nextSchools.find((account) => account.id === id);
+      const changedStatus = patch.ativo !== undefined && patch.ativo !== before.ativo;
+      const changedAccess = Boolean(patch.accessos);
+      if (!changedStatus && !changedAccess) return;
+      const description = changedStatus
+        ? `${patch.ativo === false ? "Bloqueou" : "Liberou"} a escola ${upper(after?.escola.nome || before.escola.nome)}.`
+        : `Alterou acessos da escola ${upper(after?.escola.nome || before.escola.nome)}.`;
+      recordAction("ESCOLA", description, { schoolId: id, schoolName: after?.escola.nome || before.escola.nome, targetId: id, targetName: after?.escola.nome || before.escola.nome });
+    }
   };
 
-  const changeFirstPassword = (password: string) => {
+  const changeFirstPassword = async (password: string) => {
     if (auth?.role !== "school" || !auth.schoolId) return;
     const cleanPassword = password.trim();
     if (cleanPassword.length < 6 || cleanPassword === "123456") {
       window.alert("Crie uma senha com pelo menos 6 caracteres e diferente da senha provisoria.");
       return;
+    }
+    if (firebaseEnabled) {
+      try {
+        const changed = await changeCloudPassword({ nextPassword: cleanPassword, firstAccess: true });
+        if (!changed) throw new Error("Falha ao alterar senha.");
+      } catch (error) {
+        console.error("Falha ao alterar senha.", error);
+        window.alert("Não foi possível alterar a senha agora.");
+        return;
+      }
     }
     setData((current) => ({
       ...current,
@@ -2725,19 +3761,54 @@ function App() {
         };
       }),
     }));
+    setSaveState("Senha alterada");
+    showSaveNotice("Senha alterada com sucesso");
   };
 
-  const persistData = async (nextData = data, successMessage = "Dados salvos") => {
+  const updateHistoryModel = (model: HistoryModel) => {
+    if (auth?.role !== "school" || !auth.schoolId) {
+      window.alert("Entre com o login da escola para alterar o modelo.");
+      return;
+    }
+    if (!canEditHistoryModel) {
+      window.alert("Somente o acesso principal da escola pode alterar o modelo do histórico.");
+      return;
+    }
+    const clean = normalizeModel({ ...model, updatedAt: new Date().toISOString() });
+    const nextData = {
+      ...data,
+      modelos: {
+        ...(data.modelos ?? {}),
+        [auth.schoolId]: clean,
+      },
+    };
+    setData(nextData);
+    void persistData(nextData, "Modelo salvo");
+    recordAction("MODELO", "Alterou o modelo do histórico.", { targetName: "MODELO DO HISTÓRICO" });
+  };
+
+  const persistData = async (nextData = dataRef.current, successMessage = "Dados salvos", options: { saveHistories?: boolean } = {}) => {
     window.localStorage.setItem(storageKey, JSON.stringify(nextData));
-    if (!firebaseEnabled) { setSaveState("Salvo"); return false; }
-    try {
-      const stateSaved = await saveCloudState(cloudReadyData(nextData));
-      const historiesSaved = await saveCloudHistories(nextData.historicos.map(cloudReadyHistory));
-      if (!stateSaved || !historiesSaved) throw new Error("Falha ao salvar no banco.");
+    if (!firebaseEnabled) {
       setSaveState(successMessage);
+      showSaveNotice(`${successMessage} com sucesso`);
       return true;
     }
-    catch (error) { console.error("Falha ao salvar.", error); setSaveState(saveFailureState(error)); return false; }
+    try {
+      const stateSaved = await saveCloudState(cloudReadySystemData(nextData));
+      const historiesSaved = options.saveHistories === false ? true : await saveCloudHistories(nextData.historicos.map(cloudReadyHistory));
+      if (!stateSaved || !historiesSaved) throw new Error("Falha ao salvar no banco.");
+      setSaveState(successMessage);
+      showSaveNotice(`${successMessage} com sucesso`);
+      return true;
+    }
+    catch (error) {
+      console.error("Falha ao salvar.", error);
+      const message = saveFailureState(error);
+      setSaveState(message);
+      showSaveNotice(message, "error");
+      return false;
+    }
   };
 
   const finishHistory = async (id: string, generatePdf = false) => {
@@ -2749,7 +3820,7 @@ function App() {
     };
     setData(nextData);
     const history = nextData.historicos.find((item) => item.id === id);
-    let saved = await persistData(nextData, "Salvando histórico...");
+    let saved = await persistData(nextData, "Histórico salvo");
     if (saved && history) {
       try {
         const { fotosHistorico: _photos, ...cloudHistory } = history;
@@ -2759,12 +3830,13 @@ function App() {
       } catch (error) {
         console.error("Falha ao salvar o histórico.", error);
         setSaveState("Não foi possível salvar o histórico");
+        showSaveNotice("Não foi possível salvar o histórico", "error");
         saved = false;
       }
     }
     if (saved && generatePdf) savePdfForRecord(id);
     if (saved && !generatePdf) {
-      window.alert("Histórico salvo com sucesso.");
+      if (history) recordAction("HISTORICO", `Salvou o histórico de ${upper(history.aluno.nome) || history.codigo}.`, { targetId: history.id, targetName: history.aluno.nome || history.codigo });
       setView("historicos");
     }
   };
@@ -2781,7 +3853,6 @@ function App() {
     setData(nextData);
     await saveCloudHistory(history.id, history);
     await persistData(nextData, "Histórico enviado");
-    window.alert("Histórico enviado para a escola solicitante.");
   };
 
   const receiveTransferHistory = async (requestId: string, folderId: string) => {
@@ -2805,7 +3876,7 @@ function App() {
     await persistData(nextData, "Histórico recebido");
     setActiveFolderId(folderId);
     setView("historicos");
-    window.alert("Histórico recebido e salvo na turma escolhida.");
+    recordAction("TRANSFERENCIA", `Recebeu o histórico de ${upper(received.aluno.nome) || received.codigo}.`, { targetId: received.id, targetName: received.aluno.nome || received.codigo });
   };
 
   const hideTransferMessage = async (requestId: string) => {
@@ -2851,7 +3922,7 @@ function App() {
       folder = { id: crypto.randomUUID(), schoolId: currentSchoolAccount.id, anoLetivo: String(new Date().getFullYear()), nome: "TRANSFERÊNCIAS", tipoEnsino: "ENSINO FUNDAMENTAL" };
       folders.push(folder);
     }
-    const history = createHistory(currentSchool, currentSchoolAccount.id, folder);
+    const history = createHistoryFromModel(currentSchool, currentSchoolAccount.id, folder, currentModel);
     history.aluno.nome = request.studentName;
     history.aluno.nascimento = request.studentBirth;
     const now = new Date().toISOString();
@@ -2878,7 +3949,7 @@ function App() {
     }));
   };
 
-  const createFolder = () => {
+  const createFolder = (afterCreate: "stay" | "open" = "stay") => {
     if (!requireSchoolProfile()) return;
     if (!currentSchoolAccount) return;
     const nome = folderDraft.trim();
@@ -2888,7 +3959,7 @@ function App() {
     if (existing) {
       setActiveFolderId(existing.id);
       setFolderDraft("");
-      setView("historicos");
+      if (afterCreate === "open") setView("historicos");
       return;
     }
     const folder: Folder = {
@@ -2902,7 +3973,10 @@ function App() {
     setActiveFolderId(folder.id);
     setYearFilter(folder.anoLetivo);
     setFolderDraft("");
-    setView("historicos");
+    if (afterCreate === "open") setView("historicos");
+    setSaveState("Turma criada");
+    showSaveNotice("Turma criada com sucesso");
+    recordAction("TURMA", `Criou a turma ${folder.nome} - ${folder.anoLetivo}.`, { targetId: folder.id, targetName: `${folder.nome} - ${folder.anoLetivo}` });
   };
 
   const moveRecordToFolder = (id: string, folderId: string) => {
@@ -2914,6 +3988,8 @@ function App() {
         record.id === id ? { ...record, folderId, anoLetivo: folder?.anoLetivo || "", updatedAt: new Date().toISOString() } : record,
       ),
     }));
+    setSaveState("Histórico movido");
+    showSaveNotice("Histórico movido com sucesso");
   };
 
   const createNew = (force = false) => {
@@ -2937,12 +4013,15 @@ function App() {
       setDuplicate(candidate);
       return;
     }
-    const next = createHistory(currentSchool, currentSchoolAccount.id, folder);
+    const next = createHistoryFromModel(currentSchool, currentSchoolAccount.id, folder, currentModel);
     setData((current) => ({ ...current, historicos: [next, ...current.historicos] }));
     setActiveId(next.id);
     setDuplicate(null);
     setView("editor");
     setStep(0);
+    setSaveState("Histórico criado");
+    showSaveNotice("Histórico criado com sucesso");
+    recordAction("HISTORICO", `Criou um histórico em ${folder.nome} - ${folder.anoLetivo}.`, { targetId: next.id, targetName: next.codigo });
   };
 
   const createHistoryFromPhotos = (photos: PhotoHistoryPayload) => {
@@ -2953,8 +4032,8 @@ function App() {
       window.alert("Selecione primeiro a turma e o ano letivo.");
       return;
     }
-    const blank = createHistory(currentSchool, currentSchoolAccount.id, folder);
-    const recognized = photos.record ?? applyOcrTextToHistory(blank, photos.texto, photos.palavras ?? []);
+    const blank = createHistoryFromModel(currentSchool, currentSchoolAccount.id, folder, currentModel);
+    const recognized = photos.record ?? applyOcrTextToHistory(blank, photos.texto, photos.palavras ?? [], schoolDirectory);
     const next = {
       ...blank,
       aluno: recognized.aluno,
@@ -2970,15 +4049,22 @@ function App() {
     setView("editor");
     setStep(6);
     setPage(1);
+    setSaveState("Histórico criado");
+    showSaveNotice("Histórico criado com sucesso");
+    recordAction("HISTORICO", `Criou histórico por imagem para ${upper(next.aluno.nome) || next.codigo}.`, { targetId: next.id, targetName: next.aluno.nome || next.codigo });
   };
 
   const deleteRecord = (id: string) => {
+    const removed = data.historicos.find((record) => record.id === id);
     setData((current) => {
       const next = current.historicos.filter((record) => record.id !== id);
       if (activeId === id) setActiveId(next.find((record) => record.schoolId === auth?.schoolId)?.id ?? "");
       return { ...current, historicos: next };
     });
     void deleteCloudHistory(id).catch((error) => console.error("Falha ao remover o histórico.", error));
+    setSaveState("Histórico excluído");
+    showSaveNotice("Histórico excluído com sucesso");
+    if (removed) recordAction("HISTORICO", `Excluiu o histórico de ${upper(removed.aluno.nome) || removed.codigo}.`, { targetId: removed.id, targetName: removed.aluno.nome || removed.codigo });
   };
 
   const printRecord = (id: string) => {
@@ -2987,12 +4073,12 @@ function App() {
     setActiveId(id);
     setView("editor");
     setPage(1);
-    window.setTimeout(() => printWithTitle(record?.aluno.nome || record?.codigo || "HISTORICO"), 80);
+    window.setTimeout(() => printWithTitle(upper(record?.aluno.nome || record?.codigo || "HISTORICO")), 80);
   };
 
   const savePdfForRecord = (id: string) => {
     const record = data.historicos.find((item) => item.id === id);
-    const pdfTitle = record?.aluno.nome || record?.codigo || "HISTORICO";
+    const pdfTitle = upper(record?.aluno.nome || record?.codigo || "HISTORICO");
     setData((current) => ({
       ...current,
       historicos: current.historicos.map((record) =>
@@ -3001,6 +4087,8 @@ function App() {
     }));
     if (active?.id === id && view === "editor") {
       printWithTitle(pdfTitle);
+      setSaveState("PDF aberto");
+      showSaveNotice("PDF pronto para salvar");
       return;
     }
     setPrintBatch(null);
@@ -3011,6 +4099,7 @@ function App() {
     window.setTimeout(() => {
       printWithTitle(pdfTitle);
       setSaveState("Salvo");
+      showSaveNotice("PDF pronto para salvar");
     }, 120);
   };
 
@@ -3023,7 +4112,7 @@ function App() {
     if (!recordsToPrint.length) return;
     const folder = schoolFolders.find((item) => item.id === activeFolderId);
     setPrintBatch(recordsToPrint);
-    window.setTimeout(() => printWithTitle(folder ? `${folder.anoLetivo} ${folder.nome}` : "TODOS OS HISTORICOS"), 120);
+    window.setTimeout(() => printWithTitle(upper(folder ? `${folder.anoLetivo} ${folder.nome}` : "TODOS OS HISTORICOS")), 120);
   };
 
   const downloadFolderData = () => {
@@ -3035,11 +4124,11 @@ function App() {
       pasta: folder ? { id: folder.id, nome: `${folder.anoLetivo} - ${folder.nome}` } : { id: "", nome: "TODAS" },
       historicos: recordsToExport,
     };
-    const folderName = safeFileName(folder ? `${folder.anoLetivo}-${folder.nome}` : "TODOS OS HISTORICOS");
+    const folderName = safeUpperFileName(folder ? `${folder.anoLetivo}-${folder.nome}` : "TODOS OS HISTORICOS");
     const files = [
-      { path: `${folderName}/dados-da-pasta.json`, content: JSON.stringify(payload, null, 2) },
+      { path: `${folderName}/DADOS-DA-PASTA.json`, content: JSON.stringify(payload, null, 2) },
       ...recordsToExport.map((record) => ({
-        path: `${folderName}/alunos/${safeFileName(record.aluno.nome || record.codigo)}.json`,
+        path: `${folderName}/ALUNOS/${safeUpperFileName(record.aluno.nome || record.codigo)}.json`,
         content: JSON.stringify(record, null, 2),
       })),
     ];
@@ -3052,6 +4141,8 @@ function App() {
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
+    setSaveState("Pasta baixada");
+    showSaveNotice("Pasta baixada com sucesso");
   };
 
   const payloadForRecord = (record: HistoryRecord) => JSON.stringify({
@@ -3064,7 +4155,7 @@ function App() {
     const folder = schoolFolders.find((item) => item.id === activeFolderId) ?? null;
     const recordsToExport = recordsForActiveFolder();
     if (!recordsToExport.length) return;
-    const folderName = safeFileName(folder ? `${folder.anoLetivo}-${folder.nome}` : "TODOS OS HISTORICOS");
+    const folderName = safeUpperFileName(folder ? `${folder.anoLetivo}-${folder.nome}` : "TODOS OS HISTORICOS");
     const payload = {
       exportedAt: new Date().toISOString(),
       escola: currentSchool,
@@ -3079,15 +4170,16 @@ function App() {
         return;
       }
       const directory = await picker.call(window, { mode: "readwrite" });
-      await writeTextFile(directory, [folderName, "dados-da-pasta.json"], JSON.stringify(payload, null, 2));
+      await writeTextFile(directory, [folderName, "DADOS-DA-PASTA.json"], JSON.stringify(payload, null, 2));
       for (const record of recordsToExport) {
         await writeTextFile(
           directory,
-          [folderName, "alunos", `${safeFileName(record.aluno.nome || record.codigo)}.json`],
+          [folderName, "ALUNOS", `${safeUpperFileName(record.aluno.nome || record.codigo)}.json`],
           payloadForRecord(record),
         );
       }
       setSaveState(`Pasta salva: ${folderName}`);
+      showSaveNotice("Pasta salva com sucesso");
     } catch {
       setSaveState("Salvo");
     }
@@ -3143,6 +4235,7 @@ function App() {
       });
       setView("historicos");
       setSaveState("Pasta importada");
+      showSaveNotice("Pasta importada com sucesso");
     } catch {
       setSaveState("Salvo");
     }
@@ -3167,28 +4260,39 @@ function App() {
         onCreateAdmin={createAdminAccess}
         onLoginAdmin={loginAdmin}
         onLoginSchool={loginSchool}
+        onRecoverSchoolPassword={recoverSchoolPassword}
       />
     );
   }
 
+  if (auth.role === "owner" && adminCredentials?.mustChangePassword) {
+    return screenWithNotice(<FirstAccessPassword schoolName={adminCredentials.nome || adminCredentials.usuario || auth.nome} onSave={changeRestrictedFirstPassword} onLogout={logout} />);
+  }
+
   if (currentAdminUser?.mustChangePassword) {
-    return <FirstAccessPassword schoolName={currentAdminUser.nome || currentAdminUser.usuario} onSave={changeManagerFirstPassword} onLogout={logout} />;
+    return screenWithNotice(<FirstAccessPassword schoolName={currentAdminUser.nome || currentAdminUser.usuario} onSave={changeRestrictedFirstPassword} onLogout={logout} />);
   }
 
   if (auth.role === "owner" || auth.role === "manager") {
-    return (
+    return screenWithNotice(
       <OwnerDashboard
         schools={data.escolas}
         folders={data.folders}
         histories={data.historicos}
         adminUsers={data.adminUsers ?? []}
+        activity={activity}
+        onDeleteActivity={deleteActivity}
         schoolDirectory={schoolDirectory}
         accessRole={auth.role}
         accessName={auth.nome}
+        accessLoginName={auth.role === "owner" ? adminCredentials?.usuario || "ADMIN" : currentAdminUser?.usuario || auth.nome}
+        accessEmail={auth.role === "owner" ? adminCredentials?.email || "" : currentAdminUser?.email || ""}
+        accessCpf={auth.role === "owner" ? adminCredentials?.cpf || "" : currentAdminUser?.cpf || ""}
         saveState={saveState}
         onCreateSchool={createSchoolAccountFromAdmin}
         onUpdateSchool={updateSchoolAccountFromAdmin}
         onChangeOwnPassword={changeRestrictedOwnPassword}
+        onUpdateProfile={updateRestrictedProfile}
         onCreateRestrictedAccess={createRestrictedAccess}
         onUpdateRestrictedAccess={updateRestrictedAccess}
         onDeleteRestrictedAccess={deleteRestrictedAccess}
@@ -3198,10 +4302,10 @@ function App() {
   }
 
   if (currentSchoolAccess?.mustChangePassword) {
-    return <FirstAccessPassword schoolName={currentSchool.nome} onSave={changeFirstPassword} onLogout={logout} />;
+    return screenWithNotice(<FirstAccessPassword schoolName={currentSchool.nome} onSave={changeFirstPassword} onLogout={logout} />);
   }
 
-  return (
+  return screenWithNotice(
     <main className="app-shell">
       <aside className="sidebar">
         <div className="brand">
@@ -3226,6 +4330,11 @@ function App() {
             <button className={view === "turmas" ? "nav active" : "nav"} onClick={() => setView("turmas")}>
               <span className="nav-icon">◇</span> Turmas
             </button>
+            {canEditHistoryModel && (
+              <button className={view === "modelo" ? "nav active" : "nav"} onClick={() => setView("modelo")}>
+                <span className="nav-icon">≡</span> Modelo do histórico
+              </button>
+            )}
           </>
         )}
         <div className="sidebar-rule" />
@@ -3254,8 +4363,15 @@ function App() {
           </>
         )}
         <div className="firebase-note">
-          <strong>{auth.nome}</strong>
-          <span>{upper(currentSchool.nome)}<br />{currentSchoolAccount?.tipo === "estadual" ? "Escola estadual" : "Escola municipal"}</span>
+          <div className="session-card">
+            <span className="session-avatar">{initialsFor(auth.nome)}</span>
+            <div>
+              <small>Usuário conectado</small>
+              <strong>{upper(auth.nome)}</strong>
+              <em>{currentSchoolAccess?.nivel === "principal" ? "Acesso principal" : "Acesso secundário"}</em>
+            </div>
+          </div>
+          <span className="session-school">{upper(currentSchool.nome)}<br />Escola {schoolKindLabel(currentSchoolAccount?.tipo).toLocaleLowerCase("pt-BR")}</span>
           <button type="button" onClick={logout}>Sair</button>
         </div>
       </aside>
@@ -3269,6 +4385,7 @@ function App() {
               view === "turmas" ? "Turmas e Ano Letivo" :
               view === "alunos" ? "Arquivo de Alunos" :
               view === "transferencias" ? "Transferências entre Escolas" :
+              view === "modelo" ? "Modelo do Histórico" :
               view === "novo" ? "Criar Historico" :
               "Historico Escolar"
             }</p>
@@ -3346,6 +4463,9 @@ function App() {
             school={currentSchool}
             schoolId={currentSchoolAccount?.id ?? ""}
             folders={schoolFolders}
+            model={currentModel}
+            schoolDirectory={schoolDirectory}
+            records={schoolRecords}
             activeFolderId={activeFolderId}
             setActiveFolderId={setActiveFolderId}
             createByTyping={() => createNew(true)}
@@ -3370,6 +4490,16 @@ function App() {
               setYearFilter(folder?.anoLetivo ?? "");
               setView("historicos");
             }}
+          />
+        )}
+
+        {schoolProfileReady && canEditHistoryModel && view === "modelo" && (
+          <HistoryModelEditor
+            school={currentSchool}
+            schoolId={currentSchoolAccount?.id ?? ""}
+            schoolDirectory={schoolDirectory}
+            model={currentModel}
+            onSave={updateHistoryModel}
           />
         )}
 
@@ -3401,10 +4531,10 @@ function App() {
           />
         )}
 
-        {view === "escola" && <SchoolSettings school={currentSchool} schoolDirectory={schoolDirectory} updateSchool={updateSchool} onSave={() => void persistData(data, "Dados da escola salvos")} />}
+        {view === "escola" && <SchoolSettings school={currentSchool} schoolDirectory={schoolDirectory} updateSchool={updateSchool} onSave={() => void persistData(undefined, "Dados da escola salvos")} />}
 
         {schoolProfileReady && view === "editor" && active && (
-          <div className="editor-grid">
+          <div className={previewCollapsed ? "editor-grid preview-collapsed" : "editor-grid"}>
             <section className="form-pane">
               <Progress step={step} setStep={setStep} />
               {duplicate && (
@@ -3422,30 +4552,38 @@ function App() {
                 school={currentSchool}
                 step={step}
                 updateActive={updateActive}
-                updateSchool={updateSchool}
                 schoolDirectory={schoolDirectory}
                 setStep={setStep}
                 finishHistory={finishHistory}
               />
             </section>
 
-            <section className="preview-pane">
+            <section className={previewCollapsed ? "preview-pane is-collapsed" : "preview-pane"}>
               <div className="preview-toolbar">
-                <div className="segmented">
-                  <button className={page === 1 ? "selected" : ""} onClick={() => setPage(1)}>Pagina 1</button>
-                  <button className={page === 2 ? "selected" : ""} onClick={() => setPage(2)}>Pagina 2</button>
-                </div>
-                <div className="zoom-control">
-                  <button onClick={() => setZoom((z) => Math.max(0.32, z - 0.08))}>-</button>
-                  <span>{Math.round(zoom * 100)}%</span>
-                  <button onClick={() => setZoom((z) => Math.min(0.9, z + 0.08))}>+</button>
-                </div>
+                {!previewCollapsed && (
+                  <>
+                    <div className="segmented">
+                      <button className={page === 1 ? "selected" : ""} onClick={() => setPage(1)}>Pagina 1</button>
+                      <button className={page === 2 ? "selected" : ""} onClick={() => setPage(2)}>Pagina 2</button>
+                    </div>
+                    <div className="zoom-control">
+                      <button onClick={() => setZoom((z) => Math.max(0.28, z - 0.08))}>-</button>
+                      <span>{Math.round(zoom * 100)}%</span>
+                      <button onClick={() => setZoom((z) => Math.min(0.9, z + 0.08))}>+</button>
+                    </div>
+                  </>
+                )}
+                <button className="preview-toggle" type="button" onClick={() => setPreviewCollapsed((value) => !value)}>
+                  {previewCollapsed ? "Mostrar previa" : "Minimizar"}
+                </button>
               </div>
-              <div className="paper-stage">
-                <div className="paper-scale" style={{ width: `${794 * zoom}px`, minHeight: `${1123 * zoom}px`, transform: `scale(${zoom})` }}>
-                  {page === 1 ? <DocumentPageOne record={active} school={currentSchool} /> : <DocumentPageTwo record={active} school={currentSchool} />}
+              {!previewCollapsed && (
+                <div className="paper-stage">
+                  <div className="paper-scale" style={{ width: `${794 * zoom}px`, minHeight: `${1123 * zoom}px`, transform: `scale(${zoom})` }}>
+                    {page === 1 ? <DocumentPageOne record={active} school={currentSchool} /> : <DocumentPageTwo record={active} school={currentSchool} />}
+                  </div>
                 </div>
-              </div>
+              )}
             </section>
           </div>
         )}
@@ -3469,17 +4607,22 @@ function LoginScreen({
   onCreateAdmin,
   onLoginAdmin,
   onLoginSchool,
+  onRecoverSchoolPassword,
 }: {
   hasAdmin: boolean;
   onCreateAdmin: (credentials: AdminCredentials) => void;
   onLoginAdmin: (credentials: AdminCredentials) => void;
   onLoginSchool: (credentials: SchoolLoginCredentials) => void;
+  onRecoverSchoolPassword: (input: { usuario: string; email: string; cpf: string; tipo: SchoolKind }) => boolean | Promise<boolean>;
 }) {
   const [adminUser, setAdminUser] = useState("ADMIN");
   const [adminPassword, setAdminPassword] = useState("");
   const [schoolUser, setSchoolUser] = useState("");
   const [schoolPassword, setSchoolPassword] = useState("");
   const [schoolKind, setSchoolKind] = useState<SchoolKind>("municipal");
+  const [recoverMode, setRecoverMode] = useState(false);
+  const [recoverDraft, setRecoverDraft] = useState({ usuario: "", email: "", cpf: "" });
+  const [recoverMessage, setRecoverMessage] = useState("");
 
   return (
     <main className="login-shell">
@@ -3493,34 +4636,80 @@ function LoginScreen({
         </div>
 
         <div className="login-grid">
-          <form
-            onSubmit={(event) => {
-              event.preventDefault();
-              onLoginSchool({ usuario: schoolUser, senha: schoolPassword, tipo: schoolKind });
-            }}
-          >
-            <div className="login-heading"><span>Login</span><h2>Acesso da escola</h2></div>
-            <div className="school-kind login-school-kind">
-              <span>Rede da escola</span>
+          {!recoverMode ? (
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                onLoginSchool({ usuario: schoolUser, senha: schoolPassword, tipo: schoolKind });
+              }}
+            >
+              <div className="login-heading"><span>Login</span><h2>Acesso da escola</h2></div>
+              <div className="school-kind login-school-kind">
+                <span>Rede da escola</span>
+                {schoolKindOptions.map((option) => (
+                  <label key={option.value}>
+                    <input type="checkbox" checked={schoolKind === option.value} onChange={() => setSchoolKind(option.value)} />
+                    {option.label}
+                  </label>
+                ))}
+              </div>
               <label>
-                <input type="checkbox" checked={schoolKind === "municipal"} onChange={() => setSchoolKind("municipal")} />
-                Municipal
+                <span>Usuario da escola</span>
+                <input value={schoolUser} onChange={(event) => setSchoolUser(uppercaseInput(event.target.value))} placeholder="ESCOLA001" />
               </label>
               <label>
-                <input type="checkbox" checked={schoolKind === "estadual"} onChange={() => setSchoolKind("estadual")} />
-                Estadual
+                <span>Senha</span>
+                <input type="password" value={schoolPassword} onChange={(event) => setSchoolPassword(event.target.value)} />
               </label>
-            </div>
-            <label>
-              <span>Usuario da escola</span>
-              <input value={schoolUser} onChange={(event) => setSchoolUser(uppercaseInput(event.target.value))} placeholder="ESCOLA001" />
-            </label>
-            <label>
-              <span>Senha</span>
-              <input type="password" value={schoolPassword} onChange={(event) => setSchoolPassword(event.target.value)} />
-            </label>
-            <button className="primary login-submit" type="submit">Entrar <span>→</span></button>
-          </form>
+              <button className="primary login-submit" type="submit">Entrar <span>→</span></button>
+              <button className="forgot-password-button" type="button" onClick={() => { setRecoverMode(true); setRecoverMessage(""); }}>
+                Esqueci minha senha
+              </button>
+            </form>
+          ) : (
+            <form
+              className="recovery-form"
+              onSubmit={async (event) => {
+                event.preventDefault();
+                const recovered = await onRecoverSchoolPassword({ ...recoverDraft, tipo: schoolKind });
+                if (!recovered) return;
+                setRecoverMessage("Senha provisória liberada. Entre com a senha 123456 e cadastre uma nova senha.");
+                setSchoolUser(uppercaseInput(recoverDraft.usuario));
+                setSchoolPassword("");
+              }}
+            >
+              <div className="login-heading"><span>Recuperação</span><h2>Esqueci minha senha</h2></div>
+              <div className="school-kind login-school-kind">
+                <span>Rede da escola</span>
+                {schoolKindOptions.map((option) => (
+                  <label key={option.value}>
+                    <input type="checkbox" checked={schoolKind === option.value} onChange={() => setSchoolKind(option.value)} />
+                    {option.label}
+                  </label>
+                ))}
+              </div>
+              <div className="recovery-attention">
+                <strong>ATENÇÃO:</strong>
+                <span>Para liberar uma nova senha, informe o Login, o E-mail e o CPF utilizados no cadastro do acesso da escola.</span>
+              </div>
+              <label>
+                <span>Login</span>
+                <input value={recoverDraft.usuario} onChange={(event) => setRecoverDraft((current) => ({ ...current, usuario: uppercaseInput(event.target.value) }))} />
+              </label>
+              <label>
+                <span>E-mail</span>
+                <input type="email" value={recoverDraft.email} onChange={(event) => setRecoverDraft((current) => ({ ...current, email: normalizeEmail(event.target.value) }))} />
+              </label>
+              <label>
+                <span>CPF</span>
+                <input inputMode="numeric" value={recoverDraft.cpf} onChange={(event) => setRecoverDraft((current) => ({ ...current, cpf: formatCpf(event.target.value) }))} />
+              </label>
+              <p className="recovery-help">Caso não consiga recuperar, procure o responsável pelo sistema.</p>
+              {recoverMessage && <p className="recovery-success">{recoverMessage}</p>}
+              <button className="primary login-submit" type="submit">Liberar senha <span>→</span></button>
+              <button className="forgot-password-button" type="button" onClick={() => setRecoverMode(false)}>Voltar ao login</button>
+            </form>
+          )}
 
           <form
             onSubmit={(event) => {
@@ -3547,7 +4736,7 @@ function LoginScreen({
   );
 }
 
-function FirstAccessPassword({ schoolName, onSave, onLogout }: { schoolName: string; onSave: (password: string) => void; onLogout: () => void }) {
+function FirstAccessPassword({ schoolName, onSave, onLogout }: { schoolName: string; onSave: (password: string) => void | Promise<void>; onLogout: () => void }) {
   const [password, setPassword] = useState("");
   const [confirmation, setConfirmation] = useState("");
   return (
@@ -3558,7 +4747,7 @@ function FirstAccessPassword({ schoolName, onSave, onLogout }: { schoolName: str
         <h1>Definir senha</h1>
         <p>{upper(schoolName)}</p>
         <div className="security-notice">Senha provisória: <strong>123456</strong></div>
-        <form onSubmit={(event) => { event.preventDefault(); if (password !== confirmation) { window.alert("As senhas nao conferem."); return; } onSave(password); }}>
+        <form onSubmit={(event) => { event.preventDefault(); if (password !== confirmation) { window.alert("As senhas nao conferem."); return; } void onSave(password); }}>
           <label><span>Nova senha</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" /></label>
           <label><span>Confirmar nova senha</span><input type="password" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="new-password" /></label>
           <button className="primary" type="submit">Salvar senha e continuar</button>
@@ -3574,13 +4763,19 @@ function OwnerDashboard({
   folders,
   histories,
   adminUsers,
+  activity,
+  onDeleteActivity,
   schoolDirectory,
   accessRole,
   accessName,
+  accessLoginName,
+  accessEmail,
+  accessCpf,
   saveState,
   onCreateSchool,
   onUpdateSchool,
   onChangeOwnPassword,
+  onUpdateProfile,
   onCreateRestrictedAccess,
   onUpdateRestrictedAccess,
   onDeleteRestrictedAccess,
@@ -3590,27 +4785,38 @@ function OwnerDashboard({
   folders: Folder[];
   histories: HistoryRecord[];
   adminUsers: AdminUser[];
+  activity: { activeUsers: CloudActiveUser[]; activities: CloudActivity[] };
+  onDeleteActivity: (id?: string) => void | Promise<void>;
   schoolDirectory: SchoolDirectoryItem[];
   accessRole: "owner" | "manager";
   accessName: string;
+  accessLoginName: string;
+  accessEmail: string;
+  accessCpf: string;
   saveState: string;
   onCreateSchool: (account: SchoolAccount) => void;
   onUpdateSchool: (id: string, patch: Partial<SchoolAccount> & { escola?: Partial<School> }) => void;
-  onChangeOwnPassword: (currentPassword: string, nextPassword: string, confirmation: string) => boolean;
+  onChangeOwnPassword: (currentPassword: string, nextPassword: string, confirmation: string) => boolean | Promise<boolean>;
+  onUpdateProfile: (profile: { nome: string; email: string; cpf: string }) => boolean | Promise<boolean>;
   onCreateRestrictedAccess: (input: AdminUser) => boolean | void;
   onUpdateRestrictedAccess: (id: string, patch: Partial<AdminUser>) => void;
   onDeleteRestrictedAccess: (id: string) => void;
   onLogout: () => void;
 }) {
-  const [adminView, setAdminView] = useState<"overview" | "schools" | "access" | "password">("overview");
+  const [adminView, setAdminView] = useState<"overview" | "schools" | "access" | "activity" | "profile" | "password">("overview");
   const [draft, setDraft] = useState(() => createSchoolAccount({
     usuario: "",
     senha: "123456",
     tipo: "municipal",
     escola: { ...emptySchool },
   }));
-  const [accessDrafts, setAccessDrafts] = useState<Record<string, string>>({});
+  const [accessDrafts, setAccessDrafts] = useState<Record<string, Partial<SchoolAccess>>>({});
   const [passwordDraft, setPasswordDraft] = useState({ atual: "", nova: "", confirmar: "" });
+  const [profileDraft, setProfileDraft] = useState(() => ({
+    nome: upper(accessName),
+    email: normalizeEmail(accessEmail),
+    cpf: formatCpf(accessCpf),
+  }));
   const [restrictedDraft, setRestrictedDraft] = useState(() => createAdminUser({ senha: "123456" }));
   const [schoolSearch, setSchoolSearch] = useState("");
   const canManageRestricted = accessRole === "owner";
@@ -3619,8 +4825,11 @@ function OwnerDashboard({
   const completedSchools = schools.filter((account) => isSchoolProfileReady(account.escola));
   const municipalCount = schools.filter((account) => account.tipo === "municipal").length;
   const estadualCount = schools.filter((account) => account.tipo === "estadual").length;
+  const privateCount = schools.filter((account) => account.tipo === "privada").length;
   const accessCount = schools.reduce((total, account) => total + account.accessos.length, 0);
   const activeManagers = adminUsers.filter((user) => user.ativo).length;
+  const onlineUsers = activity.activeUsers;
+  const recentActivities = activity.activities;
   const schoolNeedle = schoolSearch.trim().toLocaleLowerCase("pt-BR");
   const filteredSchools = schools.filter((account) => {
     if (!schoolNeedle) return true;
@@ -3629,15 +4838,28 @@ function OwnerDashboard({
       account.escola.codigo,
       account.escola.municipio,
       account.escola.estado,
-      account.tipo === "estadual" ? "estadual" : "municipal",
+      schoolKindLabel(account.tipo),
       account.ativo === false ? "inativa bloqueada" : "ativa liberada",
       ...account.accessos.map((access) => access.usuario),
     ].join(" ").toLocaleLowerCase("pt-BR");
     return searchable.includes(schoolNeedle);
   });
 
+  useEffect(() => {
+    setProfileDraft({ nome: upper(accessName), email: normalizeEmail(accessEmail), cpf: formatCpf(accessCpf) });
+  }, [accessName, accessEmail, accessCpf]);
+
   const updateDraftSchool = (patch: Partial<School>) => {
     setDraft((current) => ({ ...current, escola: { ...current.escola, ...patch } }));
+  };
+
+  const updateDraftPrimaryAccess = (patch: Partial<SchoolAccess>) => {
+    setDraft((current) => {
+      const primary = current.accessos[0] ?? createSchoolAccess({ usuario: current.usuario, senha: current.senha }, "principal");
+      const nextPrimary = createSchoolAccess({ ...primary, ...patch, id: primary.id, nivel: "principal", createdAt: primary.createdAt }, "principal");
+      const accessos = [nextPrimary, ...current.accessos.slice(1)];
+      return { ...current, usuario: nextPrimary.usuario, senha: nextPrimary.senha, accessos };
+    });
   };
 
   const updateAccess = (account: SchoolAccount, accessId: string, patch: Partial<SchoolAccess>) => {
@@ -3647,15 +4869,22 @@ function OwnerDashboard({
   };
 
   const addAccess = (account: SchoolAccount) => {
-    const usuario = uppercaseInput((accessDrafts[account.id] || "").trim());
-    if (!usuario) {
-      window.alert("Informe o usuario do acesso.");
+    const draftAccess = accessDrafts[account.id] ?? {};
+    const clean = createSchoolAccess({
+      ...draftAccess,
+      usuario: uppercaseInput((draftAccess.usuario || "").trim()),
+      senha: "123456",
+      nivel: "secundario",
+      mustChangePassword: true,
+    }, "secundario");
+    if (!clean.usuario || !clean.email || digitsOnly(clean.cpf).length !== 11) {
+      window.alert("Informe usuario, e-mail e CPF do acesso.");
       return;
     }
     onUpdateSchool(account.id, {
-      accessos: [...account.accessos, createSchoolAccess({ usuario, senha: "123456", mustChangePassword: true })],
+      accessos: [...account.accessos, clean],
     });
-    setAccessDrafts((current) => ({ ...current, [account.id]: "" }));
+    setAccessDrafts((current) => ({ ...current, [account.id]: {} }));
   };
 
   const removeAccess = (account: SchoolAccount, accessId: string) => {
@@ -3680,12 +4909,20 @@ function OwnerDashboard({
         </div>
         <button className={adminView === "overview" ? "nav active" : "nav"} onClick={() => setAdminView("overview")}><span className="nav-icon">◎</span> Visão geral</button>
         <button className={adminView === "schools" ? "nav active" : "nav"} onClick={() => setAdminView("schools")}><span className="nav-icon">⌂</span> Escolas</button>
+        <button className={adminView === "activity" ? "nav active" : "nav"} onClick={() => setAdminView("activity")}><span className="nav-icon">●</span> Atividade</button>
         {canManageRestricted && (
           <button className={adminView === "access" ? "nav active" : "nav"} onClick={() => setAdminView("access")}><span className="nav-icon">◈</span> Acessos</button>
         )}
+        <button className={adminView === "profile" ? "nav active" : "nav"} onClick={() => setAdminView("profile")}><span className="nav-icon">◉</span> Editar perfil</button>
         <div className="firebase-note">
-          <strong>{upper(accessName)}</strong>
-          <span>{canManageRestricted ? "Controle principal" : "Gestão educacional"}</span>
+          <div className="session-card">
+            <span className="session-avatar">{initialsFor(accessName)}</span>
+            <div>
+              <small>Usuário conectado</small>
+              <strong>{upper(accessName)}</strong>
+              <em>{canManageRestricted ? "Controle principal" : "Gestão educacional"}</em>
+            </div>
+          </div>
           <button type="button" onClick={() => setAdminView("password")}>Minha senha</button>
           <button type="button" onClick={onLogout}>Sair</button>
         </div>
@@ -3695,7 +4932,7 @@ function OwnerDashboard({
         <header className="topbar">
           <div>
             <p>Painel restrito</p>
-            <h1>{adminView === "overview" ? "Visão geral" : adminView === "access" ? "Acessos do sistema" : adminView === "password" ? "Minha senha" : "Gestão de escolas"}</h1>
+            <h1>{adminView === "overview" ? "Visão geral" : adminView === "access" ? "Acessos do sistema" : adminView === "activity" ? "Atividade do sistema" : adminView === "profile" ? "Editar perfil" : adminView === "password" ? "Minha senha" : "Gestão de escolas"}</h1>
           </div>
           <span className="save-state">{saveState === "Salvo" ? "OK Salvo" : saveState}</span>
         </header>
@@ -3706,12 +4943,14 @@ function OwnerDashboard({
               <article><span>Escolas cadastradas</span><strong>{schools.length}</strong></article>
               <article><span>Municipais</span><strong>{municipalCount}</strong></article>
               <article><span>Estaduais</span><strong>{estadualCount}</strong></article>
+              <article><span>Privadas</span><strong>{privateCount}</strong></article>
               <article><span>Acessos das escolas</span><strong>{accessCount}</strong></article>
               <article><span>Escolas ativas</span><strong>{activeSchools.length}</strong></article>
               <article><span>Escolas inativas</span><strong>{inactiveSchools.length}</strong></article>
               <article><span>Cadastros completos</span><strong>{completedSchools.length}</strong></article>
               <article><span>Responsáveis</span><strong>{adminUsers.length}</strong></article>
               <article><span>Responsáveis ativos</span><strong>{activeManagers}</strong></article>
+              <article><span>Online agora</span><strong>{onlineUsers.length}</strong></article>
             </div>
             <section className="list-screen admin-list">
               <div className="panel-heading">
@@ -3742,7 +4981,7 @@ function OwnerDashboard({
                       <tr key={account.id}>
                         <td><span className={account.ativo === false ? "status-pill inactive" : "status-pill active"}><i />{account.ativo === false ? "Inativa" : "Ativa"}</span></td>
                         <td>{upper(account.escola.nome) || "-"}</td>
-                        <td>{account.tipo === "estadual" ? "Estadual" : "Municipal"}</td>
+                        <td>{schoolKindLabel(account.tipo)}</td>
                         <td>{upper(account.escola.codigo) || "-"}</td>
                         <td>{[account.escola.municipio, account.escola.estado].filter(Boolean).map(upper).join(" - ") || "-"}</td>
                         <td>{schoolFolders.length}</td>
@@ -3769,6 +5008,8 @@ function OwnerDashboard({
                     <th>Situação</th>
                     <th>Nome</th>
                     <th>Usuario</th>
+                    <th>E-mail</th>
+                    <th>CPF</th>
                     <th>CREDE</th>
                   </tr>
                 </thead>
@@ -3778,18 +5019,118 @@ function OwnerDashboard({
                       <td><span className={user.ativo ? "status-pill active" : "status-pill inactive"}><i />{user.ativo ? "Ativo" : "Bloqueado"}</span></td>
                       <td>{upper(user.nome) || "-"}</td>
                       <td>{upper(user.usuario) || "-"}</td>
+                      <td>{normalizeEmail(user.email) || "-"}</td>
+                      <td>{formatCpf(user.cpf) || "-"}</td>
                       <td>{upper(user.crede) || "-"}</td>
                     </tr>
                   ))}
                   {!adminUsers.length && (
                     <tr>
-                      <td colSpan={4}>Nenhum responsável cadastrado ainda.</td>
+                      <td colSpan={6}>Nenhum responsável cadastrado ainda.</td>
                     </tr>
                   )}
                 </tbody>
               </table>
             </section>
           </section>
+        )}
+
+        {adminView === "activity" && (
+          <section className="activity-screen">
+            <section className="list-screen admin-list">
+              <div className="panel-heading">
+                <h2>Online agora</h2>
+              </div>
+              <div className="online-grid">
+                {onlineUsers.map((user) => (
+                  <article className="online-card" key={user.id}>
+                    <span className="live-dot" />
+                    <div>
+                      <strong>{upper(user.usuario) || "USUÁRIO"}</strong>
+                      <small>{user.perfil === "school" ? upper(user.schoolName) || "ESCOLA" : user.perfil === "owner" ? "ADMINISTRADOR" : "RESPONSÁVEL"}</small>
+                      <p>{user.actionLabel || "Online agora"}{user.targetName ? ` - ${upper(user.targetName)}` : ""}</p>
+                    </div>
+                  </article>
+                ))}
+                {!onlineUsers.length && <p className="empty-state">Nenhum usuário online agora.</p>}
+              </div>
+            </section>
+
+            <section className="list-screen admin-list">
+              <div className="panel-heading activity-heading">
+                <h2>Ações recentes</h2>
+                <button type="button" className="reset-password danger" disabled={!recentActivities.length} onClick={() => void onDeleteActivity()}>
+                  Limpar ações
+                </button>
+              </div>
+              <table className="records-table activity-table">
+                <thead>
+                  <tr>
+                    <th>Quando</th>
+                    <th>Usuário</th>
+                    <th>Escola</th>
+                    <th>Ação</th>
+                    <th>Registro</th>
+                    <th>Apagar</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {recentActivities.map((item) => (
+                    <tr key={item.id}>
+                      <td>{formatActivityTime(item.createdAt)}</td>
+                      <td><strong>{upper(item.usuario) || "-"}</strong><small>{item.perfil === "school" ? "Escola" : item.perfil === "owner" ? "Administrador" : "Responsável"}</small></td>
+                      <td>{upper(item.schoolName) || "-"}</td>
+                      <td>{item.descricao}</td>
+                      <td>{upper(item.targetName) || upper(item.tipo) || "-"}</td>
+                      <td>
+                        <button type="button" className="icon-delete-action" onClick={() => void onDeleteActivity(item.id)} aria-label="Apagar ação">
+                          ×
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {!recentActivities.length && (
+                    <tr>
+                      <td colSpan={6}>Nenhuma ação registrada ainda.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </section>
+          </section>
+        )}
+
+        {adminView === "profile" && (
+        <section className="settings-screen admin-security">
+          <div className="panel-heading">
+            <h2>Editar perfil</h2>
+          </div>
+          <form
+            className="settings-grid"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void Promise.resolve(onUpdateProfile(profileDraft)).then((changed) => {
+                if (changed) {
+                  setProfileDraft((current) => ({
+                    nome: upper(current.nome),
+                    email: normalizeEmail(current.email),
+                    cpf: formatCpf(current.cpf),
+                  }));
+                }
+              });
+            }}
+          >
+            <label>
+              <span>Nome exibido no sistema</span>
+              <input value={profileDraft.nome} onChange={(event) => setProfileDraft((current) => ({ ...current, nome: uppercaseInput(event.target.value) }))} />
+            </label>
+            <label>
+              <span>Usuário de login</span>
+              <input value={upper(accessLoginName)} readOnly />
+            </label>
+            <button className="primary" type="submit">Salvar perfil</button>
+          </form>
+        </section>
         )}
 
         {adminView === "password" && (
@@ -3801,8 +5142,9 @@ function OwnerDashboard({
             className="settings-grid"
             onSubmit={(event) => {
               event.preventDefault();
-              const changed = onChangeOwnPassword(passwordDraft.atual, passwordDraft.nova, passwordDraft.confirmar);
-              if (changed) setPasswordDraft({ atual: "", nova: "", confirmar: "" });
+              void Promise.resolve(onChangeOwnPassword(passwordDraft.atual, passwordDraft.nova, passwordDraft.confirmar)).then((changed) => {
+                if (changed) setPasswordDraft({ atual: "", nova: "", confirmar: "" });
+              });
             }}
           >
             <label>
@@ -3844,6 +5186,14 @@ function OwnerDashboard({
               <input value={restrictedDraft.usuario} onChange={(event) => setRestrictedDraft((current) => ({ ...current, usuario: uppercaseInput(event.target.value) }))} />
             </label>
             <label>
+              <span>E-mail</span>
+              <input type="email" value={restrictedDraft.email} onChange={(event) => setRestrictedDraft((current) => ({ ...current, email: normalizeEmail(event.target.value) }))} />
+            </label>
+            <label>
+              <span>CPF</span>
+              <input inputMode="numeric" value={restrictedDraft.cpf} onChange={(event) => setRestrictedDraft((current) => ({ ...current, cpf: formatCpf(event.target.value) }))} />
+            </label>
+            <label>
               <span>CREDE</span>
               <select value={restrictedDraft.crede} onChange={(event) => setRestrictedDraft((current) => ({ ...current, crede: event.target.value }))}>
                 {credeOptions.map((crede) => <option key={crede} value={crede}>{crede}</option>)}
@@ -3860,6 +5210,8 @@ function OwnerDashboard({
               <tr>
                 <th>Nome</th>
                 <th>Usuario</th>
+                <th>E-mail</th>
+                <th>CPF</th>
                 <th>CREDE</th>
                 <th>Situação</th>
                 <th>Ações</th>
@@ -3870,6 +5222,8 @@ function OwnerDashboard({
                 <tr key={user.id}>
                   <td><input value={user.nome} onChange={(event) => onUpdateRestrictedAccess(user.id, { nome: uppercaseInput(event.target.value) })} /></td>
                   <td><input value={user.usuario} onChange={(event) => onUpdateRestrictedAccess(user.id, { usuario: uppercaseInput(event.target.value) })} /></td>
+                  <td><input type="email" value={user.email} onChange={(event) => onUpdateRestrictedAccess(user.id, { email: normalizeEmail(event.target.value) })} /></td>
+                  <td><input inputMode="numeric" value={user.cpf} onChange={(event) => onUpdateRestrictedAccess(user.id, { cpf: formatCpf(event.target.value) })} /></td>
                   <td>
                     <select value={user.crede} onChange={(event) => onUpdateRestrictedAccess(user.id, { crede: event.target.value })}>
                       {credeOptions.map((crede) => <option key={crede} value={crede}>{crede}</option>)}
@@ -3891,7 +5245,7 @@ function OwnerDashboard({
               ))}
               {!adminUsers.length && (
                 <tr>
-                  <td colSpan={5}>Nenhum responsável cadastrado ainda.</td>
+                  <td colSpan={7}>Nenhum responsável cadastrado ainda.</td>
                 </tr>
               )}
             </tbody>
@@ -3931,7 +5285,15 @@ function OwnerDashboard({
             </label>
             <label>
               <span>Usuario da escola</span>
-              <input value={draft.usuario} onChange={(event) => setDraft((current) => ({ ...current, usuario: uppercaseInput(event.target.value) }))} />
+              <input value={draft.usuario} onChange={(event) => updateDraftPrimaryAccess({ usuario: uppercaseInput(event.target.value) })} />
+            </label>
+            <label>
+              <span>E-mail do acesso</span>
+              <input type="email" value={draft.accessos[0]?.email || ""} onChange={(event) => updateDraftPrimaryAccess({ email: normalizeEmail(event.target.value) })} />
+            </label>
+            <label>
+              <span>CPF do acesso</span>
+              <input inputMode="numeric" value={draft.accessos[0]?.cpf || ""} onChange={(event) => updateDraftPrimaryAccess({ cpf: formatCpf(event.target.value) })} />
             </label>
             <label>
               <span>Senha provisória</span>
@@ -3939,14 +5301,12 @@ function OwnerDashboard({
             </label>
             <div className="school-kind">
               <span>Rede da escola</span>
-              <label>
-                <input type="checkbox" checked={draft.tipo === "municipal"} onChange={() => setDraft((current) => ({ ...current, tipo: "municipal" }))} />
-                Municipal
-              </label>
-              <label>
-                <input type="checkbox" checked={draft.tipo === "estadual"} onChange={() => setDraft((current) => ({ ...current, tipo: "estadual" }))} />
-                Estadual
-              </label>
+              {schoolKindOptions.map((option) => (
+                <label key={option.value}>
+                  <input type="checkbox" checked={draft.tipo === option.value} onChange={() => setDraft((current) => ({ ...current, tipo: option.value }))} />
+                  {option.label}
+                </label>
+              ))}
             </div>
           </div>
           <button
@@ -4003,8 +5363,9 @@ function OwnerDashboard({
                   </td>
                   <td>
                     <select value={account.tipo} onChange={(event) => onUpdateSchool(account.id, { tipo: event.target.value as SchoolKind })}>
-                      <option value="municipal">Municipal</option>
-                      <option value="estadual">Estadual</option>
+                      {schoolKindOptions.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
                     </select>
                   </td>
                   <td>
@@ -4016,6 +5377,28 @@ function OwnerDashboard({
                             aria-label={`Usuario ${index + 1}`}
                             onChange={(event) => updateAccess(account, access.id, { usuario: uppercaseInput(event.target.value) })}
                           />
+                          <input
+                            type="email"
+                            value={access.email}
+                            aria-label={`E-mail do usuario ${index + 1}`}
+                            placeholder="E-MAIL"
+                            onChange={(event) => updateAccess(account, access.id, { email: normalizeEmail(event.target.value) })}
+                          />
+                          <input
+                            inputMode="numeric"
+                            value={access.cpf}
+                            aria-label={`CPF do usuario ${index + 1}`}
+                            placeholder="CPF"
+                            onChange={(event) => updateAccess(account, access.id, { cpf: formatCpf(event.target.value) })}
+                          />
+                          <select
+                            value={access.nivel}
+                            aria-label={`Nivel do usuario ${index + 1}`}
+                            onChange={(event) => updateAccess(account, access.id, { nivel: event.target.value as SchoolAccessLevel })}
+                          >
+                            <option value="principal">Principal</option>
+                            <option value="secundario">Secundário</option>
+                          </select>
                           <button
                             type="button"
                             className="reset-password"
@@ -4028,10 +5411,23 @@ function OwnerDashboard({
                       ))}
                       <div className="access-row add-access-row">
                         <input
-                          value={accessDrafts[account.id] || ""}
+                          value={accessDrafts[account.id]?.usuario || ""}
                           placeholder="NOVO USUARIO"
-                          onChange={(event) => setAccessDrafts((current) => ({ ...current, [account.id]: uppercaseInput(event.target.value) }))}
+                          onChange={(event) => setAccessDrafts((current) => ({ ...current, [account.id]: { ...(current[account.id] ?? {}), usuario: uppercaseInput(event.target.value) } }))}
                         />
+                        <input
+                          type="email"
+                          value={accessDrafts[account.id]?.email || ""}
+                          placeholder="E-MAIL"
+                          onChange={(event) => setAccessDrafts((current) => ({ ...current, [account.id]: { ...(current[account.id] ?? {}), email: normalizeEmail(event.target.value) } }))}
+                        />
+                        <input
+                          inputMode="numeric"
+                          value={accessDrafts[account.id]?.cpf || ""}
+                          placeholder="CPF"
+                          onChange={(event) => setAccessDrafts((current) => ({ ...current, [account.id]: { ...(current[account.id] ?? {}), cpf: formatCpf(event.target.value) } }))}
+                        />
+                        <span className="access-level-label">Secundário</span>
                         <button type="button" className="reset-password" onClick={() => addAccess(account)}>Adicionar</button>
                       </div>
                     </div>
@@ -4079,6 +5475,9 @@ function NewHistoryScreen({
   school,
   schoolId,
   folders,
+  model,
+  schoolDirectory,
+  records,
   activeFolderId,
   setActiveFolderId,
   createByTyping,
@@ -4088,6 +5487,9 @@ function NewHistoryScreen({
   school: School;
   schoolId: string;
   folders: Folder[];
+  model: HistoryModel;
+  schoolDirectory: SchoolDirectoryItem[];
+  records: HistoryRecord[];
   activeFolderId: string;
   setActiveFolderId: (value: string) => void;
   createByTyping: () => void;
@@ -4114,6 +5516,9 @@ function NewHistoryScreen({
         school={school}
         schoolId={schoolId}
         folders={folders}
+        model={model}
+        schoolDirectory={schoolDirectory}
+        records={records}
         activeFolderId={activeFolderId}
         setActiveFolderId={setActiveFolderId}
         createFromPhotos={createFromPhotos}
@@ -4148,6 +5553,148 @@ function NewHistoryScreen({
   );
 }
 
+function HistoryModelEditor({
+  school,
+  schoolId,
+  schoolDirectory,
+  model,
+  onSave,
+}: {
+  school: School;
+  schoolId: string;
+  schoolDirectory: SchoolDirectoryItem[];
+  model: HistoryModel;
+  onSave: (model: HistoryModel) => void;
+}) {
+  const buildDraft = () => {
+    const cleanModel = normalizeModel(model);
+    const base = createHistoryFromModel(school, schoolId, null, cleanModel);
+    return normalizeModelTemplate({
+      ...base,
+      ...(cleanModel.template ?? {}),
+      schoolId,
+      folderId: "",
+      anoLetivo: "",
+      codigo: "MODELO",
+      id: "modelo-historico",
+      status: "Em preenchimento",
+    }, schoolId);
+  };
+  const [draft, setDraft] = useState<HistoryRecord>(() => buildDraft());
+  const [modelStep, setModelStep] = useState(0);
+  const [modelPage, setModelPage] = useState(1);
+  const [modelZoom, setModelZoom] = useState(0.36);
+
+  useEffect(() => {
+    setDraft(buildDraft());
+  }, [model, schoolId]);
+
+  const updateDraft = (updater: (record: HistoryRecord) => HistoryRecord) => {
+    setDraft((current) => ({ ...updater(current), updatedAt: new Date().toISOString() }));
+  };
+
+  const updateModelColor = (key: keyof HistoryModelColors, value: string) => {
+    updateDraft((current) => ({
+      ...current,
+      modeloCores: {
+        ...normalizeModelColors(current.modeloCores),
+        [key]: normalizeHexColor(value, normalizeModelColors(current.modeloCores)[key]),
+      },
+    }));
+  };
+
+  const save = async () => {
+    const clean = normalizeModelTemplate(draft, schoolId);
+    onSave({
+      matriz: cloneMatrix(clean.matriz),
+      cores: normalizeModelColors(clean.modeloCores),
+      template: clean,
+      updatedAt: new Date().toISOString(),
+    });
+  };
+
+  const restoreDefault = () => {
+    if (!window.confirm("Voltar o modelo para o padrão inicial?")) return;
+    setDraft(normalizeModelTemplate(createHistory(school, schoolId, null, matrixSeed), schoolId));
+    setModelStep(0);
+    setModelPage(1);
+  };
+  const modelColors = normalizeModelColors(draft.modeloCores);
+
+  return (
+    <section className="model-full-editor">
+      <div className="model-editor-header">
+        <div className="panel-heading">
+          <h2>Modelo do histórico</h2>
+          <p>Altere aqui o padrão usado nos próximos históricos da escola.</p>
+        </div>
+        <div className="model-header-actions">
+          <button className="primary" type="button" onClick={() => void save()}>Salvar modelo</button>
+          <button type="button" onClick={restoreDefault}>Voltar padrão</button>
+        </div>
+      </div>
+
+      <div className="editor-grid">
+        <section className="form-pane">
+          <Progress step={modelStep} setStep={setModelStep} />
+          <StepForm
+            record={draft}
+            school={school}
+            step={modelStep}
+            updateActive={updateDraft}
+            schoolDirectory={schoolDirectory}
+            setStep={setModelStep}
+            finishHistory={async () => save()}
+            mode="model"
+          />
+          <section className="model-color-panel">
+            <div className="panel-heading">
+              <h2>Cores da tabela</h2>
+              <p>Essas cores ficam salvas somente no modelo desta escola.</p>
+            </div>
+            <div className="model-color-grid">
+              <label>
+                <span>Cor principal</span>
+                <input type="color" value={modelColors.destaque} onChange={(event) => updateModelColor("destaque", event.target.value)} />
+              </label>
+              <label>
+                <span>Cor dos anos</span>
+                <input type="color" value={modelColors.apoio} onChange={(event) => updateModelColor("apoio", event.target.value)} />
+              </label>
+              <label>
+                <span>Cor das linhas</span>
+                <input type="color" value={modelColors.borda} onChange={(event) => updateModelColor("borda", event.target.value)} />
+              </label>
+            </div>
+            <button type="button" onClick={() => updateDraft((current) => ({ ...current, modeloCores: normalizeModelColors() }))}>
+              Voltar cores padrão
+            </button>
+          </section>
+        </section>
+
+        <section className="preview-pane">
+          <div className="preview-toolbar">
+            <div className="segmented">
+              <button className={modelPage === 1 ? "selected" : ""} onClick={() => setModelPage(1)}>Pagina 1</button>
+              <button className={modelPage === 2 ? "selected" : ""} onClick={() => setModelPage(2)}>Pagina 2</button>
+            </div>
+            <div className="zoom-control">
+              <button onClick={() => setModelZoom((z) => Math.max(0.32, z - 0.08))}>-</button>
+              <span>{Math.round(modelZoom * 100)}%</span>
+              <button onClick={() => setModelZoom((z) => Math.min(0.9, z + 0.08))}>+</button>
+            </div>
+          </div>
+          <div className="paper-stage">
+            <div className="paper-scale" style={{ width: `${794 * modelZoom}px`, minHeight: `${1123 * modelZoom}px`, transform: `scale(${modelZoom})` }}>
+              {modelPage === 1 ? <DocumentPageOne record={draft} school={school} /> : <DocumentPageTwo record={draft} school={school} />}
+            </div>
+          </div>
+        </section>
+      </div>
+    </section>
+  );
+}
+
 function ClassroomScreen({
   folders,
   folderDraft,
@@ -4166,7 +5713,7 @@ function ClassroomScreen({
   setFolderDraft: (value: string) => void;
   setFolderYearDraft: (value: string) => void;
   setFolderTeachingDraft: (value: string) => void;
-  createFolder: () => void;
+  createFolder: (afterCreate?: "stay" | "open") => void;
   selectFolder: (id: string) => void;
 }) {
   return (
@@ -4196,7 +5743,10 @@ function ClassroomScreen({
           </select>
         </label>
       </div>
-      <button className="primary" onClick={createFolder}>Criar turma</button>
+      <div className="class-create-actions">
+        <button className="primary" onClick={() => createFolder("stay")}>Criar turma</button>
+        <button className="secondary" onClick={() => createFolder("open")}>Criar e abrir turma</button>
+      </div>
 
       <div className="class-cards">
         {folders.map((folder) => (
@@ -4236,7 +5786,7 @@ function StudentsArchive({
     const matchesFolder = !folderId || record.folderId === folderId;
     const matchesStatus = status === "todos" || record.status === "Emitido";
     return matchesQuery && matchesYear && matchesFolder && matchesStatus;
-  });
+  }).sort(compareStudentRecords);
 
   return (
     <section className="list-screen">
@@ -4306,6 +5856,9 @@ function PhotoHistoryImport({
   school,
   schoolId,
   folders,
+  model,
+  schoolDirectory,
+  records,
   activeFolderId,
   setActiveFolderId,
   createFromPhotos,
@@ -4314,6 +5867,9 @@ function PhotoHistoryImport({
   school: School;
   schoolId: string;
   folders: Folder[];
+  model: HistoryModel;
+  schoolDirectory: SchoolDirectoryItem[];
+  records: HistoryRecord[];
   activeFolderId: string;
   setActiveFolderId: (value: string) => void;
   createFromPhotos: (photos: PhotoHistoryPayload) => void;
@@ -4322,11 +5878,25 @@ function PhotoHistoryImport({
   const [front, setFront] = useState("");
   const [back, setBack] = useState("");
   const [ocrState, setOcrState] = useState("");
+  const [isReading, setIsReading] = useState(false);
   const [rawText, setRawText] = useState("");
   const [ocrWords, setOcrWords] = useState<OcrWord[]>([]);
   const [draft, setDraft] = useState<HistoryRecord | null>(null);
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [cameraState, setCameraState] = useState("");
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
   const selectedFolder = folders.find((folder) => folder.id === activeFolderId) ?? null;
-  const createBlankDraft = () => createHistory(school, schoolId, selectedFolder);
+  const createBlankDraft = () => createHistoryFromModel(school, schoolId, selectedFolder, model);
+
+  const stopCamera = () => {
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
+    setCameraOpen(false);
+  };
+
+  useEffect(() => () => stopCamera(), []);
 
   const readPhoto = async (side: "front" | "back", file?: File) => {
     const image = await imageFileToOcrPng(file);
@@ -4335,18 +5905,99 @@ function PhotoHistoryImport({
     else setBack(image);
   };
 
-  const fillFromImages = async () => {
-    if (!front || !back) return;
+  const startCamera = async () => {
     try {
-      setOcrState("Lendo frente e verso...");
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setCameraState("Camera indisponivel neste navegador.");
+        return;
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1600 },
+          height: { ideal: 2200 },
+        },
+        audio: false,
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+      setCameraOpen(true);
+      setCameraState("Camera pronta para capturar.");
+    } catch {
+      setCameraState("Nao foi possivel abrir a camera.");
+    }
+  };
+
+  const capturePhoto = async (side: "front" | "back") => {
+    const video = videoRef.current;
+    if (!video?.videoWidth || !video.videoHeight) {
+      setCameraState("Aguarde a camera carregar.");
+      return;
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const image = await prepareImageForOcr(canvas.toDataURL("image/png"));
+    if (side === "front") setFront(image);
+    else setBack(image);
+    setCameraState(side === "front" ? "Frente capturada." : "Verso capturado.");
+  };
+
+  const fillFromQr = async () => {
+    if (!front && !back) return;
+    try {
+      setIsReading(true);
+      setOcrState("Lendo QR code...");
+      const qrText = await readQrFromImages(front, back);
+      if (!qrText) {
+        setOcrState("Nenhum QR code encontrado na imagem.");
+        return;
+      }
+      const base = createBlankDraft();
+      const shared = historyFromSharedText(qrText, base, records);
+      setRawText(qrText);
+      setOcrWords([]);
+      if (!shared) {
+        setDraft(null);
+        setOcrState("QR code lido, mas nao pertence a um historico do sistema.");
+        return;
+      }
+      setDraft(shared);
+      setOcrState("QR code lido. Confira antes de aplicar no modelo.");
+    } catch {
+      setOcrState("Nao foi possivel ler o QR code nesta imagem.");
+    } finally {
+      setIsReading(false);
+    }
+  };
+
+  const fillFromImages = async () => {
+    if (!front && !back) return;
+    try {
+      setIsReading(true);
+      setOcrState(front && back ? "Lendo frente e verso..." : "Lendo imagem...");
       const result = await readHistoryTextFromImages(front, back);
       setRawText(result.text);
       setOcrWords(result.words);
-      setDraft(applyOcrTextToHistory(createBlankDraft(), result.text, result.words));
-      setOcrState("Confira os campos lidos antes de aplicar");
-    } catch {
-      setOcrState("");
-      window.alert("Nao consegui ler a imagem automaticamente. Tente uma foto mais nitida, reta e bem iluminada.");
+      const recognized = applyOcrTextToHistory(createBlankDraft(), result.text, result.words, schoolDirectory);
+      setDraft(recognized);
+      setOcrState(result.text.trim() || result.words.length
+        ? "Leitura feita. Confira os dados antes de aplicar no modelo."
+        : "Imagem aberta. Confira e preencha os campos em branco.");
+    } catch (error) {
+      console.error("Falha na leitura automatica do historico.", error);
+      setRawText("");
+      setOcrWords([]);
+      setDraft(createBlankDraft());
+      setOcrState("Nao foi possivel ler tudo. Confira e preencha os campos em branco.");
+    } finally {
+      setIsReading(false);
     }
   };
 
@@ -4403,50 +6054,90 @@ function PhotoHistoryImport({
     } : current);
   };
 
+  const updateDraftStudy = (index: number, patch: Partial<StudyRow>) => {
+    setDraft((current) => current ? {
+      ...current,
+      estudos: current.estudos.map((study, studyIndex) => studyIndex === index ? { ...study, ...patch } : study),
+    } : current);
+  };
+
   return (
     <section className="settings-screen photo-import">
-      <div className="panel-heading">
-        <h2>Foto do historico</h2>
-        <p>Envie frente e verso para criar o historico na turma selecionada.</p>
+      <div className="panel-heading photo-import-heading">
+        <div>
+          <span className="eyebrow">Criar historico por imagem</span>
+          <h2>Leitura por QR Code</h2>
+          <p>Importe o QR Code do historico gerado pelo sistema.</p>
+        </div>
+        <strong>QR</strong>
       </div>
-      <div className="settings-grid">
-        <label className="wide">
-          <span>Turma / ano</span>
-          <select value={activeFolderId} onChange={(event) => setActiveFolderId(event.target.value)}>
-            <option value="">Selecione</option>
-            {folders.map((folder) => <option key={folder.id} value={folder.id}>{folderTitle(folder)} - {folder.tipoEnsino}</option>)}
-          </select>
-        </label>
-        <label className="photo-drop">
-          <span>Frente</span>
-          <input type="file" accept="image/*" capture="environment" onChange={(event) => readPhoto("front", event.target.files?.[0])} />
-          {front && <img src={front} alt="" />}
-        </label>
-        <label className="photo-drop">
-          <span>Verso</span>
-          <input type="file" accept="image/*" capture="environment" onChange={(event) => readPhoto("back", event.target.files?.[0])} />
-          {back && <img src={back} alt="" />}
-        </label>
-      </div>
-      <div className="inline-actions">
-        <button onClick={backToChoice}>Voltar</button>
-        <button
-          className="primary"
-          disabled={!activeFolderId || !front || !back}
-          onClick={fillFromImages}
-        >
-          Digitalizar imagem
-        </button>
-        {ocrState && <span className="save-state">{ocrState}</span>}
+      <div className="qr-import-shell">
+        <div className="qr-import-main">
+          <label className="wide">
+            <span>Turma / ano</span>
+            <select value={activeFolderId} onChange={(event) => setActiveFolderId(event.target.value)}>
+              <option value="">Selecione</option>
+              {folders.map((folder) => <option key={folder.id} value={folder.id}>{folderTitle(folder)} - {folder.tipoEnsino}</option>)}
+            </select>
+          </label>
+          <div className="photo-drop-grid">
+            <label className="photo-drop">
+              <span>Frente</span>
+              <input type="file" accept="image/*" capture="environment" onChange={(event) => readPhoto("front", event.target.files?.[0])} />
+              {front ? <img src={front} alt="" /> : <strong>Selecionar imagem</strong>}
+            </label>
+            <label className="photo-drop">
+              <span>Verso</span>
+              <small>Opcional</small>
+              <input type="file" accept="image/*" capture="environment" onChange={(event) => readPhoto("back", event.target.files?.[0])} />
+              {back ? <img src={back} alt="" /> : <strong>Selecionar imagem</strong>}
+            </label>
+          </div>
+        </div>
+        <div className="qr-import-side">
+          <div className="camera-panel">
+            <div className="camera-actions">
+              <button type="button" onClick={startCamera}>Abrir camera</button>
+              <button type="button" disabled={!cameraOpen} onClick={() => void capturePhoto("front")}>Capturar frente</button>
+              <button type="button" disabled={!cameraOpen} onClick={() => void capturePhoto("back")}>Capturar verso</button>
+              <button type="button" disabled={!cameraOpen} onClick={stopCamera}>Fechar</button>
+            </div>
+            {cameraOpen && (
+              <div className="camera-preview">
+                <video ref={videoRef} playsInline muted />
+              </div>
+            )}
+            {cameraState && <span className="save-state">{cameraState}</span>}
+          </div>
+          <div className="qr-import-action">
+            <button onClick={backToChoice}>Voltar</button>
+            <button
+              className="primary"
+              disabled={!activeFolderId || (!front && !back) || isReading}
+              onClick={fillFromQr}
+            >
+              {isReading ? "Lendo QR Code" : "Ler QR Code"}
+            </button>
+            <button
+              className="secondary"
+              disabled={!activeFolderId || (!front && !back) || isReading}
+              onClick={fillFromImages}
+            >
+              Ler imagem de outro modelo
+            </button>
+          </div>
+          {ocrState && <span className="qr-status">{ocrState}</span>}
+        </div>
       </div>
       {draft && (
         <section className="ocr-review">
           <div className="panel-heading">
-            <h2>Conferir digitalizacao</h2>
-            <p>Corrija somente o que a leitura pegou errado. Depois aplique no nosso modelo.</p>
+            <h2>Conferir QR Code</h2>
+            <p>Confira os dados antes de aplicar no modelo.</p>
           </div>
           <div className="form-grid">
             <Field label="Nome completo" value={draft.aluno.nome} onChange={(value) => updateDraftStudent({ nome: value })} wide />
+            <Field label="ID do aluno" value={draft.aluno.idAluno} onChange={(value) => updateDraftStudent({ idAluno: value })} />
             <Field label="Data de nascimento" type="date" value={draft.aluno.nascimento} onChange={(value) => updateDraftStudent({ nascimento: value })} />
             <Field label="Nacionalidade" value={draft.aluno.nacionalidade} onChange={(value) => updateDraftStudent({ nacionalidade: value })} />
             <LocationFields
@@ -4459,9 +6150,42 @@ function PhotoHistoryImport({
                 naturalidadeEstado: patch.estado ?? draft.aluno.naturalidadeEstado,
               })}
             />
-            <Field label="Identidade" value={draft.aluno.identidade} onChange={(value) => updateDraftStudent({ identidade: value })} />
             <Field label="Nome do pai" value={draft.aluno.pai} onChange={(value) => updateDraftStudent({ pai: value })} />
             <Field label="Nome da mae" value={draft.aluno.mae} onChange={(value) => updateDraftStudent({ mae: value })} />
+          </div>
+          <div className="ocr-studies-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>Ano</th>
+                  <th>Ano letivo</th>
+                  <th>Estabelecimento</th>
+                  <th>Cidade</th>
+                  <th>UF</th>
+                </tr>
+              </thead>
+              <tbody>
+                {draft.estudos.map((study, index) => (
+                  <tr key={study.serie}>
+                    <td>{study.serie}</td>
+                    <td><input value={study.ano} onChange={(event) => updateDraftStudy(index, { ano: uppercaseInput(event.target.value) })} /></td>
+                    <td>
+                      <SchoolNameInput
+                        value={study.escola}
+                        onChange={(value) => updateDraftStudy(index, { escola: value })}
+                        municipio={study.cidade}
+                        estado={study.estado}
+                        schoolDirectory={schoolDirectory}
+                        placeholder="Estabelecimento"
+                        compact
+                      />
+                    </td>
+                    <td><input value={study.cidade} onChange={(event) => updateDraftStudy(index, { cidade: uppercaseInput(event.target.value) })} /></td>
+                    <td><input value={study.estado} onChange={(event) => updateDraftStudy(index, { estado: uppercaseInput(event.target.value) })} /></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
           <div className="ocr-mini-table">
             <table>
@@ -4482,7 +6206,7 @@ function PhotoHistoryImport({
                   <tr key={component.id}>
                     <td>{component.nome}</td>
                     {years.map((year) => (
-                      <td key={year}><input inputMode="decimal" title="Use nota de 0 a 10,0" value={draft.notas[component.id]?.[year] ?? ""} onChange={(event) => updateDraftNote(component.id, year, event.target.value)} onBlur={(event) => finishDraftNote(component.id, year, event.target.value)} /></td>
+                      <td key={year}><input inputMode="text" title="Use nota, letras ou símbolos" value={draft.notas[component.id]?.[year] ?? ""} onChange={(event) => updateDraftNote(component.id, year, event.target.value)} onBlur={(event) => finishDraftNote(component.id, year, event.target.value)} /></td>
                     ))}
                   </tr>
                 ))}
@@ -4503,12 +6227,7 @@ function PhotoHistoryImport({
               </tbody>
             </table>
           </div>
-          <label className="wide">
-            <span>Texto lido da imagem</span>
-            <textarea value={rawText} onChange={(event) => setRawText(event.target.value)} />
-          </label>
           <div className="inline-actions">
-            <button onClick={() => setDraft(applyOcrTextToHistory(createBlankDraft(), rawText, ocrWords))}>Refazer leitura pelos campos</button>
             <button className="primary" onClick={() => createFromPhotos({ frente: front, verso: back, texto: rawText, palavras: ocrWords, record: draft })}>
               Aplicar no nosso modelo
             </button>
@@ -4765,15 +6484,88 @@ function TransfersScreen({
   );
 }
 
+type MediaAssetCardProps = {
+  title: string;
+  description: string;
+  value: string;
+  onUpload: (file?: File) => void | Promise<void>;
+  onUrlChange?: (value: string) => void;
+  onRemoveBackground: () => void | Promise<void>;
+  onClear: () => void;
+  compact?: boolean;
+  toggle?: {
+    label: string;
+    checked: boolean;
+    disabled?: boolean;
+    onChange: (checked: boolean) => void;
+  };
+};
+
+function MediaAssetCard({
+  title,
+  description,
+  value,
+  onUpload,
+  onUrlChange,
+  onRemoveBackground,
+  onClear,
+  compact = false,
+  toggle,
+}: MediaAssetCardProps) {
+  const inputId = useId();
+  return (
+    <article className={compact ? "media-card compact" : "media-card"}>
+      <div className="media-card-head">
+        <div>
+          <strong>{title}</strong>
+          <span>{description}</span>
+        </div>
+        <small className={value ? "media-status ready" : "media-status"}>{value ? "Pronto" : "Vazio"}</small>
+      </div>
+      <div className={value ? "media-preview has-image" : "media-preview"}>
+        {value ? <img src={value} alt="" /> : <span>Sem imagem</span>}
+      </div>
+      {onUrlChange && (
+        <input value={value} onChange={(event) => onUrlChange(event.target.value)} placeholder="Colar link da imagem" />
+      )}
+      {toggle && (
+        <label className="media-toggle">
+          <input
+            type="checkbox"
+            checked={toggle.checked}
+            disabled={toggle.disabled}
+            onChange={(event) => toggle.onChange(event.target.checked)}
+          />
+          <span>{toggle.label}</span>
+        </label>
+      )}
+      <div className="media-actions">
+        <input id={inputId} className="media-file-input" type="file" accept="image/*" onChange={(event) => void onUpload(event.target.files?.[0])} />
+        <label className="media-upload-button" htmlFor={inputId}>Escolher imagem</label>
+        <button type="button" disabled={!value} onClick={() => void onRemoveBackground()}>Remover fundo</button>
+        <button type="button" className="danger" disabled={!value} onClick={onClear}>Limpar</button>
+      </div>
+    </article>
+  );
+}
+
 function SchoolSettings({ school, schoolDirectory, updateSchool, onSave }: { school: School; schoolDirectory: SchoolDirectoryItem[]; updateSchool: (patch: Partial<School>) => void; onSave: () => void }) {
-  const uploadSchoolImage = async (key: "logoSistema" | "logo" | "carimboEscola" | "assinaturaDiretor" | "assinaturaSecretario", file?: File) => {
+  const uploadSchoolImage = async (key: SchoolImageKey, file?: File) => {
     const image = await imageFileToTransparentPng(file);
     if (!image) return;
     updateSchool({ [key]: image });
   };
-  const makeSchoolImageTransparent = async (key: "logoSistema" | "logo" | "carimboEscola" | "assinaturaDiretor" | "assinaturaSecretario", value: string) => {
+  const makeSchoolImageTransparent = async (key: SchoolImageKey, value: string) => {
     updateSchool({ [key]: await removeLightBackground(value) });
   };
+  const mediaItems: Array<{ key: SchoolImageKey; title: string; description: string; url?: boolean }> = [
+    { key: "logoSistema", title: "Logo do sistema", description: "Aparece no painel da escola.", url: true },
+    { key: "logo", title: "Logo do histórico", description: "Aparece no cabeçalho da folha.", url: true },
+    { key: "marcaDagua", title: "Marca d'água", description: "Fica ao fundo das páginas do histórico.", url: true },
+    { key: "carimboEscola", title: "Carimbo da escola", description: "Entra no quadro superior quando marcado." },
+    { key: "assinaturaDiretor", title: "Diretora", description: "Carimbo ou assinatura da direção." },
+    { key: "assinaturaSecretario", title: "Secretaria", description: "Carimbo ou assinatura da secretaria." },
+  ];
   const fields: Array<[keyof School, string]> = [
     ["nome", "Nome do estabelecimento"],
     ["mantenedora", "Entidade mantenedora"],
@@ -4810,63 +6602,29 @@ function SchoolSettings({ school, schoolDirectory, updateSchool, onSave }: { sch
             )}
           </label>
         ))}
-        <label className="wide signature-upload">
-          <span>Logomarca do sistema</span>
-          <input value={school.logoSistema} onChange={(event) => updateSchool({ logoSistema: event.target.value })} placeholder="URL da imagem ou deixe vazio" />
-          <input type="file" accept="image/*" onChange={(event) => uploadSchoolImage("logoSistema", event.target.files?.[0])} />
-          {school.logoSistema && (
+        <section className="school-media-panel wide">
+          <div className="media-panel-heading">
             <div>
-              <img src={school.logoSistema} alt="" />
-              <button type="button" onClick={() => makeSchoolImageTransparent("logoSistema", school.logoSistema)}>Remover fundo</button>
-              <button type="button" onClick={() => updateSchool({ logoSistema: "" })}>Remover</button>
+              <h3>Imagens da escola</h3>
+              <p>Logo, marca d'água e carimbos usados nos históricos.</p>
             </div>
-          )}
-        </label>
-        <label className="wide signature-upload">
-          <span>Brasao/logomarca do historico</span>
-          <input value={school.logo} onChange={(event) => updateSchool({ logo: event.target.value })} placeholder="URL da imagem ou deixe vazio" />
-          <input type="file" accept="image/*" onChange={(event) => uploadSchoolImage("logo", event.target.files?.[0])} />
-          {school.logo && (
-            <div>
-              <img src={school.logo} alt="" />
-              <button type="button" onClick={() => makeSchoolImageTransparent("logo", school.logo)}>Remover fundo</button>
-              <button type="button" onClick={() => updateSchool({ logo: "" })}>Remover</button>
-            </div>
-          )}
-        </label>
-        <label className="wide signature-upload">
-          <span>Carimbo da escola no cabeçalho</span>
-          <input type="file" accept="image/*" onChange={(event) => uploadSchoolImage("carimboEscola", event.target.files?.[0])} />
-          {school.carimboEscola && (
-            <div>
-              <img src={school.carimboEscola} alt="" />
-              <button type="button" onClick={() => makeSchoolImageTransparent("carimboEscola", school.carimboEscola)}>Remover fundo</button>
-              <button type="button" onClick={() => updateSchool({ carimboEscola: "" })}>Remover</button>
-            </div>
-          )}
-        </label>
-        <label className="wide signature-upload">
-          <span>Carimbo/assinatura da diretora</span>
-          <input type="file" accept="image/*" onChange={(event) => uploadSchoolImage("assinaturaDiretor", event.target.files?.[0])} />
-          {school.assinaturaDiretor && (
-            <div>
-              <img src={school.assinaturaDiretor} alt="" />
-              <button type="button" onClick={() => makeSchoolImageTransparent("assinaturaDiretor", school.assinaturaDiretor)}>Remover fundo</button>
-              <button type="button" onClick={() => updateSchool({ assinaturaDiretor: "" })}>Remover</button>
-            </div>
-          )}
-        </label>
-        <label className="wide signature-upload">
-          <span>Carimbo/assinatura da secretaria</span>
-          <input type="file" accept="image/*" onChange={(event) => uploadSchoolImage("assinaturaSecretario", event.target.files?.[0])} />
-          {school.assinaturaSecretario && (
-            <div>
-              <img src={school.assinaturaSecretario} alt="" />
-              <button type="button" onClick={() => makeSchoolImageTransparent("assinaturaSecretario", school.assinaturaSecretario)}>Remover fundo</button>
-              <button type="button" onClick={() => updateSchool({ assinaturaSecretario: "" })}>Remover</button>
-            </div>
-          )}
-        </label>
+            <span>{mediaItems.filter((item) => school[item.key]).length}/{mediaItems.length}</span>
+          </div>
+          <div className="media-grid">
+            {mediaItems.map((item) => (
+              <MediaAssetCard
+                key={item.key}
+                title={item.title}
+                description={item.description}
+                value={school[item.key]}
+                onUrlChange={item.url ? (value) => updateSchool({ [item.key]: value }) : undefined}
+                onUpload={(file) => uploadSchoolImage(item.key, file)}
+                onRemoveBackground={() => makeSchoolImageTransparent(item.key, school[item.key])}
+                onClear={() => updateSchool({ [item.key]: "" })}
+              />
+            ))}
+          </div>
+        </section>
       </div>
       <div className="settings-savebar">
         <button className="primary" type="button" onClick={onSave}>Salvar dados da escola</button>
@@ -4893,78 +6651,81 @@ function StepForm({
   school,
   step,
   updateActive,
-  updateSchool,
   schoolDirectory,
   setStep,
   finishHistory,
+  mode = "history",
 }: {
   record: HistoryRecord;
   school: School;
   step: number;
   updateActive: (updater: (record: HistoryRecord) => HistoryRecord) => void;
-  updateSchool: (patch: Partial<School>) => void;
   schoolDirectory: SchoolDirectoryItem[];
   setStep: (step: number) => void;
   finishHistory: (id: string, generatePdf?: boolean) => Promise<void>;
+  mode?: "history" | "model";
 }) {
   const updateStudent = (patch: Partial<Student>) => updateActive((item) => ({ ...item, aluno: { ...item.aluno, ...patch } }));
   const updateLegal = (patch: Partial<SchoolLegal>) => updateActive((item) => ({ ...item, dadosLegais: { ...item.dadosLegais, ...patch } }));
 
   return (
     <section className="step-card">
-      {step === 0 && (
-        <>
-          <h2>Identificacao do Aluno</h2>
-          <div className="form-grid">
-            <Field label="Nome completo" value={record.aluno.nome} onChange={(value) => updateStudent({ nome: value })} wide />
-            <Field label="Data de nascimento" type="date" value={record.aluno.nascimento} onChange={(value) => updateStudent({ nascimento: value })} />
-            <Field label="Nacionalidade" value={record.aluno.nacionalidade} onChange={(value) => updateStudent({ nacionalidade: value })} />
-            <LocationFields
-              cityLabel="Naturalidade - cidade"
-              stateLabel="Naturalidade - estado"
-              municipio={record.aluno.naturalidadeCidade}
-              estado={record.aluno.naturalidadeEstado}
-              onChange={(patch) => updateStudent({
-                naturalidadeCidade: patch.municipio ?? record.aluno.naturalidadeCidade,
-                naturalidadeEstado: patch.estado ?? record.aluno.naturalidadeEstado,
-              })}
-            />
-            <Field label="Identidade" value={record.aluno.identidade} onChange={(value) => updateStudent({ identidade: value })} />
-            <label className="checkbox-line wide">
-              <input
-                type="checkbox"
-                checked={record.aluno.paiNaoDeclarado}
-                onChange={(event) => updateStudent({ paiNaoDeclarado: event.target.checked, pai: event.target.checked ? "" : record.aluno.pai })}
+      <div className="step-scroll">
+        {step === 0 && (
+          <>
+            <h2>Identificacao do Aluno</h2>
+            <div className="form-grid">
+              <Field label="Nome completo" value={record.aluno.nome} onChange={(value) => updateStudent({ nome: value })} wide />
+              <Field label="ID do aluno" value={record.aluno.idAluno} onChange={(value) => updateStudent({ idAluno: value })} />
+              <Field label="Data de nascimento" type="date" value={record.aluno.nascimento} onChange={(value) => updateStudent({ nascimento: value })} />
+              <Field label="Nacionalidade" value={record.aluno.nacionalidade} onChange={(value) => updateStudent({ nacionalidade: value })} />
+              <LocationFields
+                cityLabel="Naturalidade - cidade"
+                stateLabel="Naturalidade - estado"
+                municipio={record.aluno.naturalidadeCidade}
+                estado={record.aluno.naturalidadeEstado}
+                onChange={(patch) => updateStudent({
+                  naturalidadeCidade: patch.municipio ?? record.aluno.naturalidadeCidade,
+                  naturalidadeEstado: patch.estado ?? record.aluno.naturalidadeEstado,
+                })}
               />
-              Nao consta pai no registro
-            </label>
-            <Field label="Nome do pai" value={record.aluno.pai} onChange={(value) => updateStudent({ pai: value })} disabled={record.aluno.paiNaoDeclarado} />
-            <Field label="Nome da mae" value={record.aluno.mae} onChange={(value) => updateStudent({ mae: value })} />
-          </div>
-        </>
-      )}
+              <label className="checkbox-line wide">
+                <input
+                  type="checkbox"
+                  checked={record.aluno.paiNaoDeclarado}
+                  onChange={(event) => updateStudent({ paiNaoDeclarado: event.target.checked, pai: event.target.checked ? "" : record.aluno.pai })}
+                />
+                Nao consta pai no registro
+              </label>
+              <Field label="Nome do pai" value={record.aluno.pai} onChange={(value) => updateStudent({ pai: value })} disabled={record.aluno.paiNaoDeclarado} />
+              <Field label="Nome da mae" value={record.aluno.mae} onChange={(value) => updateStudent({ mae: value })} />
+            </div>
+          </>
+        )}
 
-      {step === 1 && (
-        <>
-          <h2>Dados do Ensino Fundamental</h2>
-          <div className="form-grid">
-            <Field label="Parecer" value={record.dadosLegais.parecer} onChange={(value) => updateLegal({ parecer: value })} />
-            <Field label="Validade" value={record.dadosLegais.validade} onChange={(value) => updateLegal({ validade: value })} />
-          </div>
-        </>
-      )}
+        {step === 1 && (
+          <>
+            <h2>Dados do Ensino Fundamental</h2>
+            <div className="form-grid">
+              <Field label="Parecer" value={record.dadosLegais.parecer} onChange={(value) => updateLegal({ parecer: value })} />
+              <Field label="Validade" value={record.dadosLegais.validade} onChange={(value) => updateLegal({ validade: value })} />
+            </div>
+          </>
+        )}
 
-      {step === 2 && <NotesForm record={record} school={school} updateActive={updateActive} />}
-      {step === 3 && <WorkloadForm record={record} updateActive={updateActive} />}
-      {step === 4 && <StudiesForm record={record} schoolDirectory={schoolDirectory} updateActive={updateActive} />}
-      {step === 5 && <CertificateForm record={record} school={school} updateActive={updateActive} updateSchool={updateSchool} />}
-      {step === 6 && (
-        <Conference
-          record={record}
-          setStep={setStep}
-          finishHistory={finishHistory}
-        />
-      )}
+        {step === 2 && <NotesForm record={record} school={school} updateActive={updateActive} />}
+        {step === 3 && <WorkloadForm record={record} updateActive={updateActive} />}
+        {step === 4 && <StudiesForm record={record} schoolDirectory={schoolDirectory} updateActive={updateActive} />}
+        {step === 5 && <CertificateForm record={record} school={school} updateActive={updateActive} />}
+        {step === 6 && (
+          <Conference
+            record={record}
+            setStep={setStep}
+            finishHistory={finishHistory}
+            mode={mode}
+          />
+        )}
+      </div>
 
       <div className="step-actions">
         <button disabled={step === 0} onClick={() => setStep(Math.max(0, step - 1))}>Voltar</button>
@@ -5204,7 +6965,7 @@ function NotesForm({ record, school, updateActive }: { record: HistoryRecord; sc
           </button>
         ))}
       </div>
-      <div className="matrix-editor" ref={tableRef}>
+      <div className="matrix-editor notes-matrix-editor" ref={tableRef}>
         <table>
           <thead>
             <tr>
@@ -5229,8 +6990,8 @@ function NotesForm({ record, school, updateActive }: { record: HistoryRecord; sc
                         data-row={rowIndex}
                         data-col={colIndex}
                         disabled={disabled}
-                        inputMode="decimal"
-                        title="Use nota de 0 a 10,0"
+                        inputMode="text"
+                        title="Use nota, letras ou símbolos"
                         value={disabled ? "-" : record.notas[component.id]?.[year] ?? ""}
                         onChange={(event) => updateNote(component.id, year, event.target.value)}
                         onBlur={(event) => finishNote(component.id, year, event.target.value)}
@@ -5425,36 +7186,17 @@ function CertificateForm({
   record,
   school,
   updateActive,
-  updateSchool,
 }: {
   record: HistoryRecord;
   school: School;
   updateActive: (updater: (record: HistoryRecord) => HistoryRecord) => void;
-  updateSchool: (patch: Partial<School>) => void;
 }) {
   const updateCertificate = (patch: Partial<Certificate>) => {
     updateActive((item) => ({ ...item, certificado: { ...item.certificado, ...patch } }));
   };
-  const uploadSignature = async (key: "assinaturaDiretor" | "assinaturaSecretario", file?: File) => {
-    const image = await imageFileToTransparentPng(file);
-    if (!image) return;
-    updateSchool({ [key]: image });
-  };
-  const makeSignatureTransparent = async (key: "assinaturaDiretor" | "assinaturaSecretario", value: string) => {
-    updateSchool({ [key]: await removeLightBackground(value) });
-  };
   return (
     <>
       <h2>Certificado e Observacoes</h2>
-      <label className="checkbox-line certificate-toggle">
-        <input
-          type="checkbox"
-          checked={record.usarCarimboEscola}
-          disabled={!school.carimboEscola}
-          onChange={(event) => updateActive((item) => ({ ...item, usarCarimboEscola: event.target.checked }))}
-        />
-        <span>Usar carimbo da escola no cabeçalho</span>
-      </label>
       <label className="checkbox-line certificate-toggle">
         <input
           type="checkbox"
@@ -5468,49 +7210,50 @@ function CertificateForm({
         <Field label="Ano de conclusao" value={record.certificado.anoConclusao} onChange={(value) => updateCertificate({ anoConclusao: value })} disabled={!record.certificado.preencher} />
         <Field label="Prosseguimento dos estudos" value={record.certificado.prosseguimento} onChange={(value) => updateCertificate({ prosseguimento: value })} disabled={!record.certificado.preencher} />
       </div>
-      <h3>Carimbo / assinatura</h3>
-      <div className="form-grid">
-        <label className="wide signature-upload">
-          <span>Carimbo/assinatura da diretora</span>
-          <input type="file" accept="image/*" onChange={(event) => uploadSignature("assinaturaDiretor", event.target.files?.[0])} />
-          <label className="checkbox-line stamp-toggle">
+      <section className="stamp-choice-panel">
+        <h3>Carimbos do documento</h3>
+        <div className="stamp-choice-list">
+          <label className="checkbox-line certificate-toggle">
+            <input
+              type="checkbox"
+              checked={record.usarCarimboEscola}
+              disabled={!school.carimboEscola}
+              onChange={(event) => updateActive((item) => ({ ...item, usarCarimboEscola: event.target.checked }))}
+            />
+            <span>Usar carimbo da escola no cabeçalho</span>
+            <small>{school.carimboEscola ? "Cadastrado em Dados da escola" : "Cadastre primeiro em Dados da escola"}</small>
+          </label>
+          <label className="checkbox-line certificate-toggle">
             <input
               type="checkbox"
               checked={record.usarAssinaturaDiretor}
               disabled={!school.assinaturaDiretor}
               onChange={(event) => updateActive((item) => ({ ...item, usarAssinaturaDiretor: event.target.checked }))}
             />
-            Usar carimbo/assinatura da diretora neste historico
+            <span>Usar carimbo/assinatura da diretora</span>
+            <small>{school.assinaturaDiretor ? "Cadastrado em Dados da escola" : "Cadastre primeiro em Dados da escola"}</small>
           </label>
-          {school.assinaturaDiretor && (
-            <div>
-              <img src={school.assinaturaDiretor} alt="" />
-              <button type="button" onClick={() => makeSignatureTransparent("assinaturaDiretor", school.assinaturaDiretor)}>Remover fundo</button>
-              <button type="button" onClick={() => updateSchool({ assinaturaDiretor: "" })}>Remover</button>
-            </div>
-          )}
-        </label>
-        <label className="wide signature-upload">
-          <span>Carimbo/assinatura da secretaria</span>
-          <input type="file" accept="image/*" onChange={(event) => uploadSignature("assinaturaSecretario", event.target.files?.[0])} />
-          <label className="checkbox-line stamp-toggle">
+          <label className="checkbox-line certificate-toggle">
             <input
               type="checkbox"
               checked={record.usarAssinaturaSecretario}
               disabled={!school.assinaturaSecretario}
               onChange={(event) => updateActive((item) => ({ ...item, usarAssinaturaSecretario: event.target.checked }))}
             />
-            Usar carimbo/assinatura da secretaria neste historico
+            <span>Usar carimbo/assinatura da secretaria</span>
+            <small>{school.assinaturaSecretario ? "Cadastrado em Dados da escola" : "Cadastre primeiro em Dados da escola"}</small>
           </label>
-          {school.assinaturaSecretario && (
-            <div>
-              <img src={school.assinaturaSecretario} alt="" />
-              <button type="button" onClick={() => makeSignatureTransparent("assinaturaSecretario", school.assinaturaSecretario)}>Remover fundo</button>
-              <button type="button" onClick={() => updateSchool({ assinaturaSecretario: "" })}>Remover</button>
-            </div>
-          )}
-        </label>
-      </div>
+          <label className="checkbox-line certificate-toggle">
+            <input
+              type="checkbox"
+              checked={record.usarQrCode}
+              onChange={(event) => updateActive((item) => ({ ...item, usarQrCode: event.target.checked }))}
+            />
+            <span>Usar QR Code neste histórico</span>
+            <small>Marque somente quando o documento puder sair com código de leitura.</small>
+          </label>
+        </div>
+      </section>
       <div className="observations-editor">
         {record.observacoes.map((obs, index) => (
           <label key={index}>
@@ -5537,12 +7280,15 @@ function Conference({
   record,
   setStep,
   finishHistory,
+  mode = "history",
 }: {
   record: HistoryRecord;
   setStep: (step: number) => void;
   finishHistory: (id: string, generatePdf?: boolean) => Promise<void>;
+  mode?: "history" | "model";
 }) {
   const issues = useMemo(() => {
+    if (mode === "model") return [];
     const list: Array<{ label: string; step: number }> = [];
     if (!record.aluno.nome) list.push({ label: "Nome do aluno nao informado", step: 0 });
     if (!record.aluno.nascimento) list.push({ label: "Data de nascimento nao informada", step: 0 });
@@ -5560,17 +7306,17 @@ function Conference({
       if (!record.resultados[year] || record.resultados[year] === "Nao informado") list.push({ label: `Resultado final do ${year}o ano nao informado`, step: 2 });
     });
     return list.slice(0, 12);
-  }, [record]);
+  }, [record, mode]);
 
   return (
     <>
-      <h2>Conferir Historico</h2>
+      <h2>{mode === "model" ? "Conferir Modelo" : "Conferir Historico"}</h2>
       <div className="conference">
         <p className="ok">OK Dados da escola carregados</p>
         <p className="ok">OK Previa montada automaticamente</p>
         <p className="ok">OK Calculo de frequencia aplicado</p>
         {issues.length === 0 ? (
-          <p className="ok">OK Historico pronto para emissao</p>
+          <p className="ok">{mode === "model" ? "OK Modelo pronto para salvar" : "OK Historico pronto para emissao"}</p>
         ) : (
           issues.map((issue) => (
             <button key={issue.label} className="warning" onClick={() => setStep(issue.step)}>
@@ -5579,7 +7325,7 @@ function Conference({
           ))
         )}
       </div>
-      <div className="inline-actions"><button className="primary" onClick={() => void finishHistory(record.id)}>Salvar histórico</button></div>
+      <div className="inline-actions"><button className="primary" onClick={() => void finishHistory(record.id)}>{mode === "model" ? "Salvar modelo" : "Salvar histórico"}</button></div>
     </>
   );
 }
@@ -5648,8 +7394,8 @@ function studyValue(study: StudyRow, key: "ano" | "escola" | "cidade" | "estado"
 
 const printYearLabels = years.map((year) => `${year}° ANO`);
 
-function Watermark() {
-  return <img className="watermark-image" src="/model-assets/image2.png" alt="" />;
+function Watermark({ school }: { school: School }) {
+  return <img className="watermark-image" src={school.marcaDagua || defaultSchool.marcaDagua} alt="" />;
 }
 
 function DocumentHeader({ school, useSchoolStamp }: { school: School; useSchoolStamp: boolean }) {
@@ -5691,10 +7437,27 @@ function DocumentPageOne({ record, school }: { record: HistoryRecord; school: Sc
     fim: 9,
     avaliativo: true,
   }))];
+  const matrixRowTotal = 3 + matrixGroups.reduce((total, group) => total + group.rows.length, 0) + 1 + diversifiedRows.length + extraRows.length + 1;
+  const matrixBaseHeight = 628;
+  const matrixRowHeight = Math.min(19, Math.max(12.2, matrixBaseHeight / matrixRowTotal));
+  const compactRatio = matrixRowHeight / 19;
+  const modeloCores = normalizeModelColors(record.modeloCores);
+  const pageOneStyle = {
+    "--matrix-row-height": `${matrixRowHeight}px`,
+    "--matrix-font-size": `${Math.max(6.7, 8.8 * compactRatio)}px`,
+    "--matrix-note-size": `${Math.max(7, 10 * compactRatio)}px`,
+    "--matrix-head-size": `${Math.max(8.2, 11 * compactRatio)}px`,
+    "--matrix-section-size": `${Math.max(9.5, 14 * compactRatio)}px`,
+    "--matrix-area-size": `${Math.max(5.9, 6.7 * compactRatio)}px`,
+    "--matrix-diversified-size": `${Math.max(6.5, 8.4 * compactRatio)}px`,
+    "--matrix-main-fill": modeloCores.destaque,
+    "--matrix-sub-fill": modeloCores.apoio,
+    "--matrix-border-color": modeloCores.borda,
+  } as CSSProperties;
 
   return (
-    <article className="paper document-page vector-page page-one current-model">
-      <Watermark />
+    <article className="paper document-page vector-page page-one current-model" style={pageOneStyle}>
+      <Watermark school={school} />
       <DocumentHeader school={school} useSchoolStamp={record.usarCarimboEscola} />
 
       <div className="document-title-box"><h1>HISTÓRICO ESCOLAR</h1></div>
@@ -5714,7 +7477,7 @@ function DocumentPageOne({ record, school }: { record: HistoryRecord; school: Sc
           <span>{formatDate(record.aluno.nascimento)}</span>
           <span>{upper(nacionalidade)}</span>
           <span>{upper(naturalidade)}</span>
-          <span>{upper(record.aluno.identidade)}</span>
+          <span>{printCell(record.aluno.identidade || "-")}</span>
         </div>
         <div className="family-box">
           <div className="center-label">FILIAÇÃO</div>
@@ -5811,7 +7574,7 @@ function DocumentPageTwo({ record, school }: { record: HistoryRecord; school: Sc
 
   return (
     <article className="paper document-page vector-page page-two current-model">
-      <Watermark />
+      <Watermark school={school} />
 
       <table className="doc-table workload-table">
         <colgroup>
@@ -5872,14 +7635,21 @@ function DocumentPageTwo({ record, school }: { record: HistoryRecord; school: Sc
         </tbody>
       </table>
 
-      <section className="current-observations">
-        <h2>OBSERVAÇÕES:</h2>
-        <div>
+      <table className="current-observations">
+        <tbody>
+          <tr>
+            <td className="observation-id-cell">ID: {upper(record.aluno.idAluno)}</td>
+            <th className="observation-title-cell">OBSERVAÇÕES:</th>
+          </tr>
+          <tr>
+            <td className="observation-content-cell" colSpan={2}>
           {record.observacoes.filter(Boolean).map((obs, index) => (
             <p key={`obs-${index}`}>{upper(obs)}</p>
           ))}
-        </div>
-      </section>
+            </td>
+          </tr>
+        </tbody>
+      </table>
 
       <section className="current-signatures">
         <p>{upper(formatLocalData(record, school))}</p>
@@ -5893,6 +7663,8 @@ function DocumentPageTwo({ record, school }: { record: HistoryRecord; school: Sc
           {!showSecretaryStamp && <small>SECRETÁRIO (A) – REG. Nº</small>}
         </div>
       </section>
+
+      {record.usarQrCode && <HistoryQrCode record={record} />}
 
       <section className="current-certificate">
         <h2>CERTIFICADO</h2>
