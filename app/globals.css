@@ -293,6 +293,14 @@ label span {
   color: #fff;
 }
 
+.login-loading {
+  margin: -2px 0 0;
+  color: var(--primary-dark);
+  font-size: 13px;
+  font-weight: 800;
+  text-align: center;
+}
+
 .forgot-password-button {
   width: 100%;
   min-height: 34px;
@@ -907,6 +915,29 @@ label span {
 
 .admin-search input {
   min-height: 42px;
+}
+
+.list-pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin: -2px 0 12px;
+}
+
+.list-pager span {
+  margin-right: auto;
+  color: #475467;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.list-pager button {
+  min-height: 34px;
+  border-radius: 10px;
+  padding: 0 12px;
+  font-size: 12px;
 }
 
 .overview-screen {
@@ -2449,6 +2480,8 @@ label span {
   pointer-events: none;
   object-fit: contain;
   opacity: 0.16;
+  background: transparent;
+  mix-blend-mode: multiply;
   transform: translate(-50%, -50%);
 }
 
@@ -2559,6 +2592,8 @@ label span {
   width: 100%;
   max-width: 214px;
   max-height: 132px;
+  background: transparent;
+  mix-blend-mode: multiply;
   object-fit: contain;
 }
 
@@ -3084,13 +3119,15 @@ label span {
 
 .vector-page .doc-table th,
 .vector-page .doc-table td {
-  border: 1px solid #000000;
+  border: 1px solid var(--matrix-border-color, #000000);
   padding: 1px 3px;
   text-align: center;
   vertical-align: middle;
 }
 
-.vector-page .current-matrix td {
+.vector-page .current-matrix td,
+.vector-page .current-observations th,
+.vector-page .current-observations td {
   border-color: var(--matrix-border-color, #000000);
 }
 
@@ -3131,6 +3168,11 @@ label span {
 .current-matrix .matrix-head {
   height: calc(var(--matrix-row-height, 19px) + 5px);
   font-size: var(--matrix-head-size, 11px);
+}
+
+.current-matrix .matrix-left-title {
+  background: var(--matrix-main-fill, #d9d9d9);
+  vertical-align: middle;
 }
 
 .current-matrix .matrix-subhead {
@@ -3343,6 +3385,8 @@ label span {
   z-index: 2;
   width: 240px;
   max-height: 96px;
+  background: transparent;
+  mix-blend-mode: multiply;
   object-fit: contain;
   transform: translateX(-50%);
   pointer-events: none;
@@ -3379,8 +3423,8 @@ label span {
   /* fica imediatamente acima do certificado */
   bottom: 138px !important;
 
-  width: 2cm;
-  height: 2cm;
+  width: 2.35cm;
+  height: 2.35cm;
 
   z-index: 10;
 
@@ -3396,8 +3440,8 @@ label span {
 
 .history-qr img {
   display: block;
-  width: 1.78cm;
-  height: 1.78cm;
+  width: 2.12cm;
+  height: 2.12cm;
   object-fit: contain;
   image-rendering: pixelated;
 }
@@ -4334,17 +4378,20 @@ label span {
 .vector-page .workload-table .workload-year,
 .vector-page .workload-table .vertical-cell,
 .vector-page .current-studies .vertical-cell {
-  background: #d9d9d9;
+  background: var(--matrix-main-fill, #d9d9d9);
 }
 
-.vector-page .current-matrix .matrix-subhead,
-.vector-page .current-matrix .note-value:nth-child(n + 4):nth-child(-n + 9) {
-  background: rgba(198, 239, 218, 0.52);
+.vector-page .current-matrix .matrix-subhead {
+  background: var(--matrix-sub-fill, rgba(198, 239, 218, 0.52));
 }
 
 .vector-page .current-matrix .area-cell,
 .vector-page .current-matrix .vertical-cell {
-  background: #d9d9d9;
+  background: var(--matrix-main-fill, #d9d9d9);
+}
+
+.vector-page .current-matrix .note-value {
+  background: transparent;
 }
 
 .vector-page .current-matrix .diversified-name {
@@ -4849,13 +4896,40 @@ label span {
 
   .print-only .watermark-image {
     display: block !important;
+    background: transparent !important;
     height: auto !important;
+    mix-blend-mode: multiply !important;
     object-fit: contain !important;
   }
 
-  .print-only .vector-page .current-matrix .matrix-subhead,
-  .print-only .vector-page .current-matrix .note-value:nth-child(n + 4):nth-child(-n + 9) {
+  .print-only .header-empty-box img,
+  .print-only .signature-stamp {
     background: transparent !important;
+    mix-blend-mode: multiply !important;
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+
+  .print-only .history-qr {
+    display: flex !important;
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+
+  .print-only .history-qr img {
+    display: block !important;
+  }
+
+  .print-only .vector-page .current-matrix .matrix-subhead {
+    background: var(--matrix-sub-fill, transparent) !important;
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+
+  .print-only .vector-page .current-matrix .note-value {
+    background: transparent !important;
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
   }
 
   .print-only .vector-page .current-matrix .matrix-head,
@@ -4876,7 +4950,7 @@ label span {
   .print-only .vector-page .workload-table .workload-year,
   .print-only .vector-page .workload-table .vertical-cell,
   .print-only .vector-page .current-studies .vertical-cell {
-    background: #d9d9d9 !important;
+    background: var(--matrix-main-fill, #d9d9d9) !important;
     print-color-adjust: exact;
     -webkit-print-color-adjust: exact;
   }

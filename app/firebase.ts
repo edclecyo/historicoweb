@@ -60,7 +60,7 @@ export const firebaseEnabled = Boolean(
 const functionsRegion = "us-east4";
 const useBackendFunctions = import.meta.env.VITE_FIREBASE_USE_FUNCTIONS !== "false";
 const cloudSessionStorageKey = "historico-escolar-online:cloud-session:v1";
-const cloudRequestTimeoutMs = 8000;
+const cloudRequestTimeoutMs = 20000;
 let cloudSessionToken: string | null = null;
 
 export function getCloudSessionToken() {
@@ -214,6 +214,7 @@ export async function loadCloudState<T extends CloudState>() {
   if (useBackendFunctions && !getCloudSessionToken()) return null;
   const backend = await callBackend<{ payload: T | null }>("loadSystemState");
   if (backend.handled) return backend.data.payload;
+  if (useBackendFunctions) return null;
   const reference = await getCloudDocument();
   if (!reference) return null;
   const snapshot = await getDoc(reference);
@@ -229,6 +230,27 @@ export async function saveCloudState(data: CloudState) {
   if (!reference) return false;
   await setDoc(reference, { payload: data, updatedAt: serverTimestamp() });
   return true;
+}
+
+export async function saveCloudSchoolProfile(profile: CloudState) {
+  const sessionToken = getCloudSessionToken();
+  if (!firebaseEnabled || !useBackendFunctions || !sessionToken) return false;
+  const result = await callRequiredBackend<{ ok: boolean }>("saveSchoolProfile", { profile, sessionToken });
+  return result.ok;
+}
+
+export async function saveCloudSchoolImage(key: string, value: string) {
+  const sessionToken = getCloudSessionToken();
+  if (!firebaseEnabled || !useBackendFunctions || !sessionToken) return false;
+  const result = await callRequiredBackend<{ ok: boolean }>("saveSchoolImage", { key, value, sessionToken });
+  return result.ok;
+}
+
+export async function saveCloudSchoolWorkspace(data: CloudState) {
+  const sessionToken = getCloudSessionToken();
+  if (!firebaseEnabled || !useBackendFunctions || !sessionToken) return false;
+  const result = await callRequiredBackend<{ ok: boolean }>("saveSchoolWorkspace", { payload: data, sessionToken });
+  return result.ok;
 }
 
 export async function loadCloudHistories<T>() {

@@ -7,7 +7,6 @@ import {
   deleteCloudHistory,
   firebaseEnabled,
   loadCloudActivity,
-  loadCloudHistories,
   loadCloudSetupStatus,
   loadCloudState,
   deleteCloudActivity,
@@ -16,8 +15,10 @@ import {
   logoutCloudSession,
   pingCloudActivity,
   recordCloudActivity,
-  saveCloudHistories,
   saveCloudHistory,
+  saveCloudSchoolImage,
+  saveCloudSchoolProfile,
+  saveCloudSchoolWorkspace,
   saveCloudState,
   setCloudSessionToken,
   updateCloudProfile,
@@ -75,6 +76,16 @@ const schoolImageKeys: SchoolImageKey[] = [
   "assinaturaSecretario",
 ];
 
+function schoolWithoutImages(school: School): School {
+  const clean = { ...school } as Record<string, unknown>;
+  for (const key of schoolImageKeys) delete clean[key];
+  return clean as School;
+}
+
+function schoolImagesOnly(school: School) {
+  return Object.fromEntries(schoolImageKeys.map((key) => [key, school[key] || ""])) as Record<SchoolImageKey, string>;
+}
+
 type SchoolKind = "municipal" | "estadual" | "privada";
 type SchoolAccessLevel = "principal" | "secundario";
 
@@ -124,6 +135,8 @@ type SchoolAccount = {
   createdAt: string;
   mustChangePassword: boolean;
   accessos: SchoolAccess[];
+  turmasCount?: number;
+  historicosCount?: number;
 };
 
 type Student = {
@@ -564,22 +577,23 @@ function isAllowedNoteTyping(value: string) {
   const text = normalizeNoteInput(value);
   if (!text || text === "-") return true;
   if (/[^0-9,]/.test(text)) return true;
-  return /^(?:10(?:,0?)?|[0-9](?:,[0-9]?)?)$/.test(text);
+  return /^(?:10(?:,0{0,2})?|[0-9](?:,[0-9]{0,2})?)$/.test(text);
 }
 
 function isValidNoteValue(value: string) {
   const text = normalizeNoteInput(value);
   if (!text || text === "-") return true;
   if (/[^0-9,]/.test(text)) return true;
-  return /^(?:10(?:,0)?|[0-9](?:,[0-9])?)$/.test(text);
+  return /^(?:10(?:,0{1,2})?|[0-9](?:,[0-9]{1,2})?)$/.test(text);
 }
 
 function formatNoteValue(value: string) {
   const text = normalizeNoteInput(value);
   if (!text || text === "-") return text;
   if (/[^0-9,]/.test(text)) return text;
-  if (!isValidNoteValue(text)) return "";
-  const [integer, decimal = "0"] = text.split(",");
+  const normalizedDecimal = text.endsWith(",") ? `${text}0` : text;
+  if (!isValidNoteValue(normalizedDecimal)) return "";
+  const [integer, decimal = "0"] = normalizedDecimal.split(",");
   return `${integer},${decimal || "0"}`;
 }
 
@@ -1103,11 +1117,10 @@ function fileToDataUrl(file: File) {
   });
 }
 
-function removeLightBackground(dataUrl: string) {
+function transparentPngWithMaxSide(dataUrl: string, maxSide = 720) {
   return new Promise<string>((resolve, reject) => {
     const image = new Image();
     image.onload = () => {
-      const maxSide = 720;
       const sourceWidth = image.naturalWidth || image.width || 1;
       const sourceHeight = image.naturalHeight || image.height || 1;
       const scale = Math.min(1, maxSide / Math.max(sourceWidth, sourceHeight));
@@ -1129,10 +1142,10 @@ function removeLightBackground(dataUrl: string) {
         const alpha = data[index + 3];
         const light = Math.min(red, green, blue);
         const spread = Math.max(red, green, blue) - light;
-        if (alpha < 8 || (light > 245 && spread < 28)) {
+        if (alpha < 8 || (light > 238 && spread < 40)) {
           data[index + 3] = 0;
-        } else if (light > 225 && spread < 36) {
-          data[index + 3] = Math.round(alpha * ((245 - light) / 20));
+        } else if (light > 210 && spread < 55) {
+          data[index + 3] = Math.max(0, Math.round(alpha * ((238 - light) / 28)));
         }
       }
       context.putImageData(pixels, 0, 0);
@@ -1143,13 +1156,20 @@ function removeLightBackground(dataUrl: string) {
   });
 }
 
+async function removeLightBackground(dataUrl: string) {
+  return transparentPngWithMaxSide(dataUrl);
+}
+
 async function imageFileToTransparentPng(file?: File) {
   if (!file) return "";
   if (!file.type.startsWith("image/")) {
     window.alert("Escolha um arquivo de imagem.");
     return "";
   }
-  return removeLightBackground(await fileToDataUrl(file));
+  let image = await transparentPngWithMaxSide(await fileToDataUrl(file), 640);
+  if (image.length > 850_000) image = await transparentPngWithMaxSide(image, 520);
+  if (image.length > 850_000) image = await transparentPngWithMaxSide(image, 420);
+  return image;
 }
 
 function prepareImageForOcr(dataUrl: string) {
@@ -1263,7 +1283,7 @@ function recognizedScore(text: string, words: OcrWord[]) {
   ];
   const labelScore = labels.filter((label) => normalized.includes(label)).length * 50;
   const dateScore = (normalized.match(/\b\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}\b/g) ?? []).length * 30;
-  const noteScore = (normalized.match(/\b(?:10(?:[,.]0)?|[0-9][,.][0-9])\b/g) ?? []).length * 12;
+  const noteScore = (normalized.match(/\b(?:10(?:[,.]0{1,2})?|[0-9][,.][0-9]{1,2})\b/g) ?? []).length * 12;
   const workloadScore = (normalized.match(/\b[1-2]?\d{3}\b/g) ?? []).length * 6;
   return labelScore + dateScore + noteScore + workloadScore + words.length + normalized.length / 20;
 }
@@ -1457,10 +1477,12 @@ function HistoryQrCode({ record }: { record: HistoryRecord }) {
     const makeQr = async () => {
       try {
         const qrcode = await import("qrcode");
-        const value = await qrcode.toDataURL(historyQrText(record), {
+        const toDataURL = qrcode.toDataURL ?? qrcode.default?.toDataURL;
+        if (!toDataURL) throw new Error("Gerador de QR Code indisponivel.");
+        const value = await toDataURL(historyQrText(record), {
           errorCorrectionLevel: "Q",
           margin: 2,
-          width: 260,
+          width: 320,
           color: {
             dark: "#000000",
             light: "#ffffff",
@@ -1711,7 +1733,7 @@ function findBirthDate(rawText: string) {
 }
 
 function valuesFromLine(line: string, maxNumber = 100) {
-  return Array.from(line.matchAll(/\b(?:APROVADO|REPROVADO|TRANSFERIDO|CURSANDO|PROGRESSAO|PROG|[0-9]{1,4}(?:[,.][0-9])?%?)\b/g))
+  return Array.from(line.matchAll(/\b(?:APROVADO|REPROVADO|TRANSFERIDO|CURSANDO|PROGRESSAO|PROG|[0-9]{1,4}(?:[,.][0-9]{1,2})?%?)\b/g))
     .map((match) => match[0].replace(".", ","))
     .filter((value) => {
       const numeric = Number(value.replace("%", "").replace(",", "."));
@@ -1730,7 +1752,7 @@ function noteValuesFromText(text: string) {
       .replace(/\b[1-9]\s*(?:O|º|°)?\s*ANO\b/g, " ")
       .replace(/\b[1-9]\s*(?:A|ª)?\s*SERIE\b/g, " ")
       .replace(/\b(?:19|20)\d{2}\b/g, " ")
-      .matchAll(/\b(?:10(?:[,.]0)?|[0-9](?:[,.][0-9])?)\b/g),
+      .matchAll(/\b(?:10(?:[,.]0{1,2})?|[0-9](?:[,.][0-9]{1,2})?)\b/g),
   ).map((match) => match[0].replace(".", ",")).slice(0, 9);
 }
 
@@ -1746,8 +1768,8 @@ function workloadValuesFromText(text: string, maxNumber = 2000) {
 function yearValuePairsFromText(text: string, maxNumber = 100) {
   const normalized = plain(text);
   const valuePattern = maxNumber <= 100
-    ? "(APROVADO|REPROVADO|TRANSFERIDO|CURSANDO|PROGRESSAO|PROG|10(?:[,.]0)?|[0-9](?:[,.][0-9])?)"
-    : "([0-9]{1,4}(?:[,.][0-9])?%?)";
+    ? "(APROVADO|REPROVADO|TRANSFERIDO|CURSANDO|PROGRESSAO|PROG|10(?:[,.]0{1,2})?|[0-9](?:[,.][0-9]{1,2})?)"
+    : "([0-9]{1,4}(?:[,.][0-9]{1,2})?%?)";
   const pairs = Array.from(normalized.matchAll(new RegExp(`\\b([1-9])\\s*(?:O|º|°|A|ª)?\\s*(?:ANO|SERIE)?\\D{0,28}?${valuePattern}\\b`, "g")))
     .map((match) => {
       const year = Number(match[1]);
@@ -2621,6 +2643,8 @@ function createSchoolAccount(input?: Partial<SchoolAccount> & { escola?: Partial
     createdAt: input?.createdAt || new Date().toISOString(),
     mustChangePassword: primaryAccess.mustChangePassword,
     accessos,
+    turmasCount: Number(input?.turmasCount ?? 0),
+    historicosCount: Number(input?.historicosCount ?? 0),
   };
 }
 
@@ -2798,6 +2822,19 @@ function loadInitialData(): AppData {
   return { escola: defaultSchool, escolas: [], folders: [], historicos: [], transferencias: [], admin: null, adminUsers: [], modelos: {} };
 }
 
+function storeLocalData(data: AppData) {
+  try {
+    window.localStorage.setItem(storageKey, JSON.stringify({
+      ...data,
+      escola: schoolWithoutImages(data.escola),
+      escolas: data.escolas.map((account) => ({ ...account, escola: schoolWithoutImages(account.escola) })),
+      historicos: data.historicos.map(cloudReadyHistory),
+    }));
+  } catch (error) {
+    console.warn("Nao foi possivel salvar copia local.", error);
+  }
+}
+
 function loadAdminCredentials() {
   if (typeof window === "undefined") return null;
   const saved = window.localStorage.getItem(adminStorageKey);
@@ -2874,7 +2911,19 @@ function cloudReadyData(data: AppData): AppData {
 function cloudReadySystemData(data: AppData): AppData {
   return {
     ...cloudReadyData(data),
+    escola: schoolWithoutImages(data.escola),
+    escolas: data.escolas.map((account) => ({ ...account, escola: schoolWithoutImages(account.escola) })),
     historicos: [],
+  };
+}
+
+function cloudReadySchoolWorkspace(data: AppData, schoolId: string) {
+  const school = data.escolas.find((account) => account.id === schoolId);
+  return {
+    escola: school ? { ...school, escola: schoolWithoutImages(school.escola) } : null,
+    folders: data.folders.filter((folder) => folder.schoolId === schoolId),
+    modelo: data.modelos?.[schoolId] ?? null,
+    transferencias: data.transferencias.filter((request) => request.fromSchoolId === schoolId || request.toSchoolId === schoolId),
   };
 }
 
@@ -2888,7 +2937,7 @@ function saveFailureState(error: unknown) {
     ? String((error as { code?: unknown }).code)
     : "";
   if (code === "permission-denied") return "Não foi possível salvar";
-  return "Salvo";
+  return "Não foi possível salvar";
 }
 
 function SaveToast({ notice, onClose }: { notice: SaveNotice | null; onClose: () => void }) {
@@ -2929,6 +2978,8 @@ function App() {
   const noticeTimer = useRef<number | null>(null);
   const qrHandledRef = useRef("");
   const dataRef = useRef(data);
+  const skipNextAutosaveRef = useRef(false);
+  const pendingWorkspaceSaveRef = useRef(false);
 
   const currentSchoolAccount = auth?.role === "school"
     ? data.escolas.find((school) => school.id === auth.schoolId)
@@ -3049,9 +3100,8 @@ function App() {
         try {
           if (session?.sessionToken) {
             const cloudData = await loadCloudState<AppData>();
-            const cloudHistories = await loadCloudHistories<HistoryRecord>();
             if (cloudData) {
-              initialData = normalizeLoadedData(cloudData, cloudHistories);
+              initialData = normalizeLoadedData(cloudData);
             } else {
               activeSession = null;
               storeAuthSession(null);
@@ -3126,31 +3176,44 @@ function App() {
 
   useEffect(() => {
     if (!isReady) return;
-    setSaveState("Salvando...");
+    if (skipNextAutosaveRef.current) {
+      skipNextAutosaveRef.current = false;
+      return;
+    }
+    const pendingWorkspace = pendingWorkspaceSaveRef.current;
+    storeLocalData(data);
+    if (!pendingWorkspace) return;
+    setSaveState("Salvando estrutura...");
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
     saveTimer.current = window.setTimeout(() => {
-      window.localStorage.setItem(storageKey, JSON.stringify(data));
+      const saveWorkspace = pendingWorkspaceSaveRef.current;
+      pendingWorkspaceSaveRef.current = false;
       if (!firebaseEnabled) {
         setSaveState("Salvo");
         return;
       }
-      if (!auth?.sessionToken) {
-        setSaveState("Salvo");
-        return;
-      }
-      void saveCloudState(cloudReadySystemData(data))
-        .then((stateSaved) => {
-          if (!stateSaved) throw new Error("Falha ao salvar dados.");
-          return saveCloudHistories(data.historicos.map(cloudReadyHistory));
-        })
-        .then((historiesSaved) => {
-          if (!historiesSaved) throw new Error("Falha ao salvar históricos.");
+      void (async () => {
+        try {
+          const writes: Promise<boolean>[] = [];
+          if (auth?.role === "school" && auth.schoolId) {
+            if (saveWorkspace) {
+              writes.push(saveCloudSchoolWorkspace(cloudReadySchoolWorkspace(data, auth.schoolId)));
+            }
+          } else if (saveWorkspace) {
+            writes.push(saveCloudState(cloudReadySystemData(data)));
+          }
+          if (!writes.length) {
+            setSaveState("Salvo");
+            return;
+          }
+          const results = await Promise.all(writes);
+          if (results.some((saved) => !saved)) throw new Error("Falha ao salvar no banco.");
           setSaveState("Salvo");
-        })
-        .catch((error) => {
+        } catch (error) {
           console.error("Falha ao salvar.", error);
           setSaveState(saveFailureState(error));
-        });
+        }
+      })();
     }, 700);
   }, [data, isReady, auth?.sessionToken]);
 
@@ -3166,14 +3229,14 @@ function App() {
       });
     };
     sendPresence();
-    const timer = window.setInterval(sendPresence, 35000);
+    const timer = window.setInterval(sendPresence, 90000);
     return () => window.clearInterval(timer);
   }, [isReady, auth, view, presenceLabel, presenceTarget, active?.id, currentSchoolAccount?.escola.nome]);
 
   useEffect(() => {
     if (!isReady || !auth || (auth.role !== "owner" && auth.role !== "manager") || !firebaseEnabled) return;
     void refreshActivity();
-    const timer = window.setInterval(() => void refreshActivity(), 25000);
+    const timer = window.setInterval(() => void refreshActivity(), 60000);
     return () => window.clearInterval(timer);
   }, [isReady, auth]);
 
@@ -3203,11 +3266,6 @@ function App() {
       window.alert("Entre com o login da escola para alterar os dados cadastrais.");
       return;
     }
-    const shouldSaveImageNow = Object.entries(patch).some(([key, value]) =>
-      schoolImageKeys.includes(key as SchoolImageKey) &&
-      typeof value === "string" &&
-      (value === "" || value.startsWith("data:image/"))
-    );
     setData((current) => {
       const nextData = {
         ...current,
@@ -3216,15 +3274,51 @@ function App() {
         ),
       };
       dataRef.current = nextData;
-      if (shouldSaveImageNow) {
-        window.setTimeout(() => void persistData(nextData, "Imagem da escola salva", { saveHistories: false }), 0);
-      }
       return nextData;
     });
   };
 
+  const saveSchoolSettings = async (school: School) => {
+    if (auth?.role !== "school" || !auth.schoolId) {
+      window.alert("Entre com o login da escola para alterar os dados cadastrais.");
+      return false;
+    }
+    const nextData = {
+      ...dataRef.current,
+      escolas: dataRef.current.escolas.map((account) =>
+        account.id === auth.schoolId ? { ...account, escola: school } : account,
+      ),
+    };
+    dataRef.current = nextData;
+    skipNextAutosaveRef.current = true;
+    setData(nextData);
+    setSaveState("Salvando...");
+    storeLocalData(nextData);
+    if (!firebaseEnabled) {
+      setSaveState("Dados da escola salvos");
+      showSaveNotice("Dados da escola salvos com sucesso");
+      return true;
+    }
+    try {
+      const profileSaved = await saveCloudSchoolProfile(schoolWithoutImages(school));
+      if (!profileSaved) throw new Error("Falha ao salvar cadastro da escola.");
+      const images = schoolImagesOnly(school);
+      const imageResults = await Promise.all(schoolImageKeys.map((key) => saveCloudSchoolImage(key, images[key])));
+      if (imageResults.some((imageSaved) => !imageSaved)) throw new Error("Falha ao salvar imagens da escola.");
+      setSaveState("Dados da escola salvos");
+      showSaveNotice("Dados da escola salvos com sucesso");
+      return true;
+    } catch (error) {
+      console.error("Falha ao salvar dados da escola.", error);
+      setSaveState("Não foi possível salvar");
+      showSaveNotice("Não foi possível salvar dados da escola", "error");
+      return false;
+    }
+  };
+
   const applyCloudLogin = (payload: AppData, session: AuthSession, histories?: HistoryRecord[]) => {
     const nextData = normalizeLoadedData(payload, histories ?? []);
+    dataRef.current = nextData;
     setData(nextData);
     setAdminCredentials(nextData.admin ?? null);
     setAuth(session);
@@ -3598,7 +3692,10 @@ function App() {
         return;
       } catch (error) {
         console.error("Falha no login da escola.", error);
-        window.alert("Usuario, senha ou rede da escola incorretos.");
+        const code = typeof error === "object" && error && "code" in error ? String((error as { code?: unknown }).code) : "";
+        window.alert(code.includes("permission-denied")
+          ? "Usuario, senha ou rede da escola incorretos."
+          : "Não foi possível entrar agora. Tente novamente em alguns segundos.");
         return;
       }
     }
@@ -3642,7 +3739,7 @@ function App() {
     return false;
   };
 
-  const createSchoolAccountFromAdmin = (account: SchoolAccount) => {
+  const createSchoolAccountFromAdmin = async (account: SchoolAccount) => {
     const createdId = account.id || crypto.randomUUID();
     const primaryInput = account.accessos[0];
     const clean = createSchoolAccount({
@@ -3678,20 +3775,25 @@ function App() {
       window.alert("Informe cidade e estado da escola.");
       return;
     }
-    const nextSchools = [...data.escolas, clean];
+    const nextSchools = [...dataRef.current.escolas, clean];
     if (hasDuplicatedSchoolAccess(nextSchools)) {
       window.alert("Ja existe esse usuario nessa rede.");
       return;
     }
-    setData((current) => ({ ...current, escolas: nextSchools }));
-    setSaveState("Escola cadastrada");
-    showSaveNotice("Escola cadastrada com sucesso");
-    recordAction("ESCOLA", `Cadastrou a escola ${upper(clean.escola.nome)}.`, { schoolId: clean.id, schoolName: clean.escola.nome, targetId: clean.id, targetName: clean.escola.nome });
+    const nextData = { ...dataRef.current, escolas: nextSchools };
+    dataRef.current = nextData;
+    skipNextAutosaveRef.current = true;
+    setData(nextData);
+    setSaveState("Salvando...");
+    const saved = await persistData(nextData, "Escola cadastrada", { saveHistories: false });
+    if (saved) {
+      recordAction("ESCOLA", `Cadastrou a escola ${upper(clean.escola.nome)}.`, { schoolId: clean.id, schoolName: clean.escola.nome, targetId: clean.id, targetName: clean.escola.nome });
+    }
   };
 
-  const updateSchoolAccountFromAdmin = (id: string, patch: Partial<SchoolAccount> & { escola?: Partial<School> }) => {
-    const before = data.escolas.find((account) => account.id === id);
-    const nextSchools = data.escolas.map((account) => {
+  const updateSchoolAccountFromAdmin = async (id: string, patch: Partial<SchoolAccount> & { escola?: Partial<School> }) => {
+    const before = dataRef.current.escolas.find((account) => account.id === id);
+    const nextSchools = dataRef.current.escolas.map((account) => {
       if (account.id !== id) return account;
       const patchedAccessos = patch.accessos
         ? patch.accessos.map((access, index) => createSchoolAccess(access, index === 0 ? "principal" : "secundario")).filter((access) => access.usuario)
@@ -3712,10 +3814,13 @@ function App() {
       window.alert("Ja existe esse usuario nessa rede.");
       return;
     }
-    setData((current) => ({ ...current, escolas: nextSchools }));
-    setSaveState("Escola atualizada");
-    showSaveNotice("Escola atualizada com sucesso");
-    if (before) {
+    const nextData = { ...dataRef.current, escolas: nextSchools };
+    dataRef.current = nextData;
+    skipNextAutosaveRef.current = true;
+    setData(nextData);
+    setSaveState("Salvando...");
+    const saved = await persistData(nextData, "Escola atualizada", { saveHistories: false });
+    if (saved && before) {
       const after = nextSchools.find((account) => account.id === id);
       const changedStatus = patch.ativo !== undefined && patch.ativo !== before.ativo;
       const changedAccess = Boolean(patch.accessos);
@@ -3782,51 +3887,67 @@ function App() {
         [auth.schoolId]: clean,
       },
     };
+    dataRef.current = nextData;
+    skipNextAutosaveRef.current = true;
     setData(nextData);
-    void persistData(nextData, "Modelo salvo");
-    recordAction("MODELO", "Alterou o modelo do histórico.", { targetName: "MODELO DO HISTÓRICO" });
+    void persistData(nextData, "Modelo salvo", { saveHistories: false }).then((saved) => {
+      if (saved) recordAction("MODELO", "Alterou o modelo do histórico.", { targetName: "MODELO DO HISTÓRICO" });
+    });
   };
 
-  const persistData = async (nextData = dataRef.current, successMessage = "Dados salvos", options: { saveHistories?: boolean } = {}) => {
-    window.localStorage.setItem(storageKey, JSON.stringify(nextData));
+  const persistData = async (nextData = dataRef.current, successMessage = "Dados salvos", options: { saveHistories?: boolean; notify?: boolean } = {}) => {
+    storeLocalData(nextData);
     if (!firebaseEnabled) {
       setSaveState(successMessage);
-      showSaveNotice(`${successMessage} com sucesso`);
+      if (options.notify !== false) showSaveNotice(`${successMessage} com sucesso`);
       return true;
     }
     try {
-      const stateSaved = await saveCloudState(cloudReadySystemData(nextData));
-      const historiesSaved = options.saveHistories === false ? true : await saveCloudHistories(nextData.historicos.map(cloudReadyHistory));
-      if (!stateSaved || !historiesSaved) throw new Error("Falha ao salvar no banco.");
+      const stateSaved = auth?.role === "school" && auth.schoolId
+        ? await saveCloudSchoolWorkspace(cloudReadySchoolWorkspace(nextData, auth.schoolId))
+        : await saveCloudState(cloudReadySystemData(nextData));
+      if (!stateSaved) throw new Error("Falha ao salvar no banco.");
       setSaveState(successMessage);
-      showSaveNotice(`${successMessage} com sucesso`);
+      if (options.notify !== false) showSaveNotice(`${successMessage} com sucesso`);
       return true;
     }
     catch (error) {
       console.error("Falha ao salvar.", error);
       const message = saveFailureState(error);
       setSaveState(message);
-      showSaveNotice(message, "error");
+      if (options.notify !== false) showSaveNotice(message, "error");
       return false;
     }
   };
 
   const finishHistory = async (id: string, generatePdf = false) => {
     const now = new Date().toISOString();
+    const hasTransferUpdate = data.transferencias.some((request) => request.historyId === id && request.status !== "Enviado");
     const nextData = {
       ...data,
       historicos: data.historicos.map((item) => item.id === id ? { ...item, status: "Emitido" as const, updatedAt: now } : item),
       transferencias: data.transferencias.map((request) => request.historyId === id ? { ...request, status: "Enviado" as const, updatedAt: now } : request),
     };
+    dataRef.current = nextData;
+    skipNextAutosaveRef.current = true;
     setData(nextData);
+    storeLocalData(nextData);
     const history = nextData.historicos.find((item) => item.id === id);
-    let saved = await persistData(nextData, "Histórico salvo");
-    if (saved && history) {
+    let saved = true;
+    setSaveState("Salvando histórico...");
+    if (history) {
       try {
         const { fotosHistorico: _photos, ...cloudHistory } = history;
-        const historySaved = await saveCloudHistory(id, cloudHistory);
-        if (!historySaved) throw new Error("Falha ao salvar o histórico.");
+        if (firebaseEnabled) {
+          const historySaved = await saveCloudHistory(id, cloudHistory);
+          if (!historySaved) throw new Error("Falha ao salvar o histórico.");
+          if (hasTransferUpdate) {
+            const workspaceSaved = await persistData(nextData, "Histórico salvo", { saveHistories: false, notify: false });
+            if (!workspaceSaved) throw new Error("Falha ao salvar movimentação.");
+          }
+        }
         setSaveState("Histórico salvo");
+        showSaveNotice("Histórico salvo com sucesso");
       } catch (error) {
         console.error("Falha ao salvar o histórico.", error);
         setSaveState("Não foi possível salvar o histórico");
@@ -3851,8 +3972,8 @@ function App() {
       transferencias: data.transferencias.map((request) => request.id === requestId ? { ...request, historyId, status: "Enviado" as const, updatedAt: now } : request),
     };
     setData(nextData);
-    await saveCloudHistory(history.id, history);
-    await persistData(nextData, "Histórico enviado");
+    await saveCloudHistory(history.id, cloudReadyHistory(history));
+    await persistData(nextData, "Histórico enviado", { saveHistories: false });
   };
 
   const receiveTransferHistory = async (requestId: string, folderId: string) => {
@@ -3873,7 +3994,7 @@ function App() {
     };
     setData(nextData);
     await saveCloudHistory(received.id, received);
-    await persistData(nextData, "Histórico recebido");
+    await persistData(nextData, "Histórico recebido", { saveHistories: false });
     setActiveFolderId(folderId);
     setView("historicos");
     recordAction("TRANSFERENCIA", `Recebeu o histórico de ${upper(received.aluno.nome) || received.codigo}.`, { targetId: received.id, targetName: received.aluno.nome || received.codigo });
@@ -3888,7 +4009,7 @@ function App() {
         : request),
     };
     setData(nextData);
-    await persistData(nextData, "Mensagem removida");
+    await persistData(nextData, "Mensagem removida", { saveHistories: false });
   };
 
   const requestTransfer = async (input: Pick<TransferRequest, "fromSchoolId" | "studentName" | "studentBirth" | "message">) => {
@@ -3908,7 +4029,7 @@ function App() {
     };
     const nextData = { ...data, transferencias: [request, ...data.transferencias] };
     setData(nextData);
-    await persistData(nextData, "Solicitação enviada");
+    await persistData(nextData, "Solicitação enviada", { saveHistories: false });
   };
 
   const prepareTransferHistory = async (requestId: string) => {
@@ -3933,7 +4054,8 @@ function App() {
       transferencias: data.transferencias.map((item) => item.id === requestId ? { ...item, status: "Em preparação" as const, historyId: history.id, updatedAt: now } : item),
     };
     setData(nextData);
-    await persistData(nextData, "Preparação iniciada");
+    await saveCloudHistory(history.id, cloudReadyHistory(history));
+    await persistData(nextData, "Preparação iniciada", { saveHistories: false });
     setActiveFolderId(folder.id);
     setActiveId(history.id);
     setStep(0);
@@ -3949,7 +4071,7 @@ function App() {
     }));
   };
 
-  const createFolder = (afterCreate: "stay" | "open" = "stay") => {
+  const createFolder = async (afterCreate: "stay" | "open" = "stay") => {
     if (!requireSchoolProfile()) return;
     if (!currentSchoolAccount) return;
     const nome = folderDraft.trim();
@@ -3969,14 +4091,19 @@ function App() {
       nome: uppercaseInput(nome),
       tipoEnsino: uppercaseInput(folderTeachingDraft),
     };
-    setData((current) => ({ ...current, folders: [...current.folders, folder] }));
+    const nextData = { ...dataRef.current, folders: [...dataRef.current.folders, folder].sort(compareFolders) };
+    dataRef.current = nextData;
+    skipNextAutosaveRef.current = true;
+    setData(nextData);
     setActiveFolderId(folder.id);
     setYearFilter(folder.anoLetivo);
     setFolderDraft("");
     if (afterCreate === "open") setView("historicos");
-    setSaveState("Turma criada");
-    showSaveNotice("Turma criada com sucesso");
-    recordAction("TURMA", `Criou a turma ${folder.nome} - ${folder.anoLetivo}.`, { targetId: folder.id, targetName: `${folder.nome} - ${folder.anoLetivo}` });
+    setSaveState("Salvando...");
+    const saved = await persistData(nextData, "Turma criada", { saveHistories: false });
+    if (saved) {
+      recordAction("TURMA", `Criou a turma ${folder.nome} - ${folder.anoLetivo}.`, { targetId: folder.id, targetName: `${folder.nome} - ${folder.anoLetivo}` });
+    }
   };
 
   const moveRecordToFolder = (id: string, folderId: string) => {
@@ -4211,28 +4338,31 @@ function App() {
         return;
       }
 
-      setData((current) => {
-        const folders = [...current.folders];
-        const byId = new Map(current.historicos.map((record) => [record.id, record]));
-        for (const imported of imports) {
-          const folderName = upper(imported.folderName);
-          let folder = folders.find((item) => item.schoolId === auth?.schoolId && upper(item.nome) === folderName);
-          if (!folder) {
-            folder = {
-              id: crypto.randomUUID(),
-              schoolId: auth?.schoolId || "",
-              anoLetivo: String(new Date().getFullYear()),
-              nome: imported.folderName,
-              tipoEnsino: "ENSINO FUNDAMENTAL",
-            };
-            folders.push(folder);
-          }
-          for (const record of imported.records) {
-            byId.set(record.id, { ...record, schoolId: auth?.schoolId || "", folderId: folder.id, anoLetivo: folder.anoLetivo, updatedAt: new Date().toISOString() });
-          }
+      const current = dataRef.current;
+      const folders = [...current.folders];
+      const byId = new Map(current.historicos.map((record) => [record.id, record]));
+      for (const imported of imports) {
+        const folderName = upper(imported.folderName);
+        let folder = folders.find((item) => item.schoolId === auth?.schoolId && upper(item.nome) === folderName);
+        if (!folder) {
+          folder = {
+            id: crypto.randomUUID(),
+            schoolId: auth?.schoolId || "",
+            anoLetivo: String(new Date().getFullYear()),
+            nome: imported.folderName,
+            tipoEnsino: "ENSINO FUNDAMENTAL",
+          };
+          folders.push(folder);
+          pendingWorkspaceSaveRef.current = true;
         }
-        return { ...current, folders, historicos: Array.from(byId.values()) };
-      });
+        for (const record of imported.records) {
+          const nextRecord = { ...record, schoolId: auth?.schoolId || "", folderId: folder.id, anoLetivo: folder.anoLetivo, updatedAt: new Date().toISOString() };
+          byId.set(record.id, nextRecord);
+        }
+      }
+      const nextData = { ...current, folders, historicos: Array.from(byId.values()) };
+      dataRef.current = nextData;
+      setData(nextData);
       setView("historicos");
       setSaveState("Pasta importada");
       showSaveNotice("Pasta importada com sucesso");
@@ -4531,7 +4661,7 @@ function App() {
           />
         )}
 
-        {view === "escola" && <SchoolSettings school={currentSchool} schoolDirectory={schoolDirectory} updateSchool={updateSchool} onSave={() => void persistData(undefined, "Dados da escola salvos")} />}
+        {view === "escola" && <SchoolSettings school={currentSchool} schoolDirectory={schoolDirectory} onSave={saveSchoolSettings} />}
 
         {schoolProfileReady && view === "editor" && active && (
           <div className={previewCollapsed ? "editor-grid preview-collapsed" : "editor-grid"}>
@@ -4610,9 +4740,9 @@ function LoginScreen({
   onRecoverSchoolPassword,
 }: {
   hasAdmin: boolean;
-  onCreateAdmin: (credentials: AdminCredentials) => void;
-  onLoginAdmin: (credentials: AdminCredentials) => void;
-  onLoginSchool: (credentials: SchoolLoginCredentials) => void;
+  onCreateAdmin: (credentials: AdminCredentials) => void | Promise<void>;
+  onLoginAdmin: (credentials: AdminCredentials) => void | Promise<void>;
+  onLoginSchool: (credentials: SchoolLoginCredentials) => void | Promise<void>;
   onRecoverSchoolPassword: (input: { usuario: string; email: string; cpf: string; tipo: SchoolKind }) => boolean | Promise<boolean>;
 }) {
   const [adminUser, setAdminUser] = useState("ADMIN");
@@ -4623,6 +4753,7 @@ function LoginScreen({
   const [recoverMode, setRecoverMode] = useState(false);
   const [recoverDraft, setRecoverDraft] = useState({ usuario: "", email: "", cpf: "" });
   const [recoverMessage, setRecoverMessage] = useState("");
+  const [loginBusy, setLoginBusy] = useState<"school" | "admin" | "recover" | null>(null);
 
   return (
     <main className="login-shell">
@@ -4638,9 +4769,15 @@ function LoginScreen({
         <div className="login-grid">
           {!recoverMode ? (
             <form
-              onSubmit={(event) => {
+              onSubmit={async (event) => {
                 event.preventDefault();
-                onLoginSchool({ usuario: schoolUser, senha: schoolPassword, tipo: schoolKind });
+                if (loginBusy) return;
+                setLoginBusy("school");
+                try {
+                  await Promise.resolve(onLoginSchool({ usuario: schoolUser, senha: schoolPassword, tipo: schoolKind }));
+                } finally {
+                  setLoginBusy(null);
+                }
               }}
             >
               <div className="login-heading"><span>Login</span><h2>Acesso da escola</h2></div>
@@ -4661,8 +4798,11 @@ function LoginScreen({
                 <span>Senha</span>
                 <input type="password" value={schoolPassword} onChange={(event) => setSchoolPassword(event.target.value)} />
               </label>
-              <button className="primary login-submit" type="submit">Entrar <span>→</span></button>
-              <button className="forgot-password-button" type="button" onClick={() => { setRecoverMode(true); setRecoverMessage(""); }}>
+              <button className="primary login-submit" type="submit" disabled={Boolean(loginBusy)}>
+                {loginBusy === "school" ? "Entrando..." : "Entrar"} <span>→</span>
+              </button>
+              {loginBusy === "school" && <p className="login-loading">Aguarde, conferindo o acesso...</p>}
+              <button className="forgot-password-button" type="button" disabled={Boolean(loginBusy)} onClick={() => { setRecoverMode(true); setRecoverMessage(""); }}>
                 Esqueci minha senha
               </button>
             </form>
@@ -4671,11 +4811,17 @@ function LoginScreen({
               className="recovery-form"
               onSubmit={async (event) => {
                 event.preventDefault();
-                const recovered = await onRecoverSchoolPassword({ ...recoverDraft, tipo: schoolKind });
-                if (!recovered) return;
-                setRecoverMessage("Senha provisória liberada. Entre com a senha 123456 e cadastre uma nova senha.");
-                setSchoolUser(uppercaseInput(recoverDraft.usuario));
-                setSchoolPassword("");
+                if (loginBusy) return;
+                setLoginBusy("recover");
+                try {
+                  const recovered = await onRecoverSchoolPassword({ ...recoverDraft, tipo: schoolKind });
+                  if (!recovered) return;
+                  setRecoverMessage("Senha provisória liberada. Entre com a senha 123456 e cadastre uma nova senha.");
+                  setSchoolUser(uppercaseInput(recoverDraft.usuario));
+                  setSchoolPassword("");
+                } finally {
+                  setLoginBusy(null);
+                }
               }}
             >
               <div className="login-heading"><span>Recuperação</span><h2>Esqueci minha senha</h2></div>
@@ -4706,17 +4852,26 @@ function LoginScreen({
               </label>
               <p className="recovery-help">Caso não consiga recuperar, procure o responsável pelo sistema.</p>
               {recoverMessage && <p className="recovery-success">{recoverMessage}</p>}
-              <button className="primary login-submit" type="submit">Liberar senha <span>→</span></button>
-              <button className="forgot-password-button" type="button" onClick={() => setRecoverMode(false)}>Voltar ao login</button>
+              <button className="primary login-submit" type="submit" disabled={Boolean(loginBusy)}>
+                {loginBusy === "recover" ? "Liberando..." : "Liberar senha"} <span>→</span>
+              </button>
+              {loginBusy === "recover" && <p className="login-loading">Aguarde, conferindo os dados...</p>}
+              <button className="forgot-password-button" type="button" disabled={Boolean(loginBusy)} onClick={() => setRecoverMode(false)}>Voltar ao login</button>
             </form>
           )}
 
           <form
-            onSubmit={(event) => {
+            onSubmit={async (event) => {
               event.preventDefault();
+              if (loginBusy) return;
               const credentials = { usuario: adminUser, senha: adminPassword };
-              if (hasAdmin) onLoginAdmin(credentials);
-              else onCreateAdmin(credentials);
+              setLoginBusy("admin");
+              try {
+                if (hasAdmin) await Promise.resolve(onLoginAdmin(credentials));
+                else await Promise.resolve(onCreateAdmin(credentials));
+              } finally {
+                setLoginBusy(null);
+              }
             }}
           >
             <div className="login-heading"><span>Restrito</span><h2>Acesso restrito</h2></div>
@@ -4728,7 +4883,10 @@ function LoginScreen({
               <span>Senha</span>
               <input type="password" value={adminPassword} onChange={(event) => setAdminPassword(event.target.value)} />
             </label>
-            <button className="login-submit secondary" type="submit">Entrar <span>→</span></button>
+            <button className="login-submit secondary" type="submit" disabled={Boolean(loginBusy)}>
+              {loginBusy === "admin" ? "Entrando..." : "Entrar"} <span>→</span>
+            </button>
+            {loginBusy === "admin" && <p className="login-loading">Aguarde, conferindo o acesso...</p>}
           </form>
         </div>
       </section>
@@ -4819,6 +4977,7 @@ function OwnerDashboard({
   }));
   const [restrictedDraft, setRestrictedDraft] = useState(() => createAdminUser({ senha: "123456" }));
   const [schoolSearch, setSchoolSearch] = useState("");
+  const [schoolPage, setSchoolPage] = useState(0);
   const canManageRestricted = accessRole === "owner";
   const activeSchools = schools.filter((account) => account.ativo !== false);
   const inactiveSchools = schools.filter((account) => account.ativo === false);
@@ -4830,6 +4989,14 @@ function OwnerDashboard({
   const activeManagers = adminUsers.filter((user) => user.ativo).length;
   const onlineUsers = activity.activeUsers;
   const recentActivities = activity.activities;
+  const folderTotalFor = (account: SchoolAccount) => {
+    const ownFolders = folders.filter((folder) => folder.schoolId === account.id);
+    return ownFolders.length || Number(account.turmasCount ?? 0);
+  };
+  const historyTotalFor = (account: SchoolAccount) => {
+    const ownHistories = histories.filter((record) => record.schoolId === account.id);
+    return ownHistories.length || Number(account.historicosCount ?? 0);
+  };
   const schoolNeedle = schoolSearch.trim().toLocaleLowerCase("pt-BR");
   const filteredSchools = schools.filter((account) => {
     if (!schoolNeedle) return true;
@@ -4844,10 +5011,25 @@ function OwnerDashboard({
     ].join(" ").toLocaleLowerCase("pt-BR");
     return searchable.includes(schoolNeedle);
   });
+  const schoolPageSize = 60;
+  const totalSchoolPages = Math.max(1, Math.ceil(filteredSchools.length / schoolPageSize));
+  const currentSchoolPage = Math.min(schoolPage, totalSchoolPages - 1);
+  const visibleSchools = filteredSchools.slice(currentSchoolPage * schoolPageSize, currentSchoolPage * schoolPageSize + schoolPageSize);
+  const schoolPager = (
+    <div className="list-pager">
+      <span>{filteredSchools.length ? `${currentSchoolPage * schoolPageSize + 1}-${Math.min((currentSchoolPage + 1) * schoolPageSize, filteredSchools.length)} de ${filteredSchools.length}` : "0 escolas"}</span>
+      <button type="button" disabled={currentSchoolPage <= 0} onClick={() => setSchoolPage((page) => Math.max(0, page - 1))}>Anterior</button>
+      <button type="button" disabled={currentSchoolPage >= totalSchoolPages - 1} onClick={() => setSchoolPage((page) => Math.min(totalSchoolPages - 1, page + 1))}>Próximo</button>
+    </div>
+  );
 
   useEffect(() => {
     setProfileDraft({ nome: upper(accessName), email: normalizeEmail(accessEmail), cpf: formatCpf(accessCpf) });
   }, [accessName, accessEmail, accessCpf]);
+
+  useEffect(() => {
+    setSchoolPage(0);
+  }, [schoolSearch, adminView]);
 
   const updateDraftSchool = (patch: Partial<School>) => {
     setDraft((current) => ({ ...current, escola: { ...current.escola, ...patch } }));
@@ -4960,6 +5142,7 @@ function OwnerDashboard({
                 <span>Pesquisar escola</span>
                 <input value={schoolSearch} onChange={(event) => setSchoolSearch(uppercaseInput(event.target.value))} placeholder="Nome, INEP, cidade, rede ou usuario" />
               </label>
+              {schoolPager}
               <table className="records-table">
                 <thead>
                   <tr>
@@ -4974,9 +5157,7 @@ function OwnerDashboard({
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredSchools.map((account) => {
-                    const schoolFolders = folders.filter((folder) => folder.schoolId === account.id);
-                    const schoolHistories = histories.filter((record) => record.schoolId === account.id);
+                  {visibleSchools.map((account) => {
                     return (
                       <tr key={account.id}>
                         <td><span className={account.ativo === false ? "status-pill inactive" : "status-pill active"}><i />{account.ativo === false ? "Inativa" : "Ativa"}</span></td>
@@ -4984,8 +5165,8 @@ function OwnerDashboard({
                         <td>{schoolKindLabel(account.tipo)}</td>
                         <td>{upper(account.escola.codigo) || "-"}</td>
                         <td>{[account.escola.municipio, account.escola.estado].filter(Boolean).map(upper).join(" - ") || "-"}</td>
-                        <td>{schoolFolders.length}</td>
-                        <td>{schoolHistories.length}</td>
+                        <td>{folderTotalFor(account)}</td>
+                        <td>{historyTotalFor(account)}</td>
                         <td>{account.accessos.length}</td>
                       </tr>
                     );
@@ -5333,6 +5514,7 @@ function OwnerDashboard({
             <span>Pesquisar escola</span>
             <input value={schoolSearch} onChange={(event) => setSchoolSearch(uppercaseInput(event.target.value))} placeholder="Nome, INEP, cidade, rede ou usuario" />
           </label>
+          {schoolPager}
           <table className="records-table">
             <thead>
               <tr>
@@ -5344,7 +5526,7 @@ function OwnerDashboard({
               </tr>
             </thead>
             <tbody>
-              {filteredSchools.map((account) => (
+              {visibleSchools.map((account) => (
                 <tr key={account.id}>
                   <td>
                     <label className="status-toggle school-status-toggle">
@@ -5654,11 +5836,11 @@ function HistoryModelEditor({
             </div>
             <div className="model-color-grid">
               <label>
-                <span>Cor principal</span>
+                <span>Cor dos cabeçalhos</span>
                 <input type="color" value={modelColors.destaque} onChange={(event) => updateModelColor("destaque", event.target.value)} />
               </label>
               <label>
-                <span>Cor dos anos</span>
+                <span>Cor do ano letivo</span>
                 <input type="color" value={modelColors.apoio} onChange={(event) => updateModelColor("apoio", event.target.value)} />
               </label>
               <label>
@@ -6549,14 +6731,22 @@ function MediaAssetCard({
   );
 }
 
-function SchoolSettings({ school, schoolDirectory, updateSchool, onSave }: { school: School; schoolDirectory: SchoolDirectoryItem[]; updateSchool: (patch: Partial<School>) => void; onSave: () => void }) {
+function SchoolSettings({ school, schoolDirectory, onSave }: { school: School; schoolDirectory: SchoolDirectoryItem[]; onSave: (school: School) => boolean | Promise<boolean> }) {
+  const [draft, setDraft] = useState(school);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    setDraft(school);
+  }, [school]);
+  const updateDraft = (patch: Partial<School>) => {
+    setDraft((current) => ({ ...current, ...patch }));
+  };
   const uploadSchoolImage = async (key: SchoolImageKey, file?: File) => {
     const image = await imageFileToTransparentPng(file);
     if (!image) return;
-    updateSchool({ [key]: image });
+    updateDraft({ [key]: image });
   };
   const makeSchoolImageTransparent = async (key: SchoolImageKey, value: string) => {
-    updateSchool({ [key]: await removeLightBackground(value) });
+    updateDraft({ [key]: await removeLightBackground(value) });
   };
   const mediaItems: Array<{ key: SchoolImageKey; title: string; description: string; url?: boolean }> = [
     { key: "logoSistema", title: "Logo do sistema", description: "Aparece no painel da escola.", url: true },
@@ -6581,24 +6771,24 @@ function SchoolSettings({ school, schoolDirectory, updateSchool, onSave }: { sch
       </div>
       <div className="settings-grid">
         <LocationFields
-          estado={school.estado}
-          municipio={school.municipio}
-          onChange={(patch) => updateSchool(patch)}
+          estado={draft.estado}
+          municipio={draft.municipio}
+          onChange={(patch) => updateDraft(patch)}
         />
         {fields.map(([key, label]) => (
           <label key={key} className={key === "nome" || key === "mantenedora" ? "wide" : ""}>
             <span>{label}</span>
             {key === "nome" ? (
               <SchoolNameInput
-                value={school.nome}
-                onChange={(value) => updateSchool({ nome: value })}
-                municipio={school.municipio}
-                estado={school.estado}
+                value={draft.nome}
+                onChange={(value) => updateDraft({ nome: value })}
+                municipio={draft.municipio}
+                estado={draft.estado}
                 schoolDirectory={schoolDirectory}
                 placeholder="Nome do estabelecimento"
               />
             ) : (
-              <input value={school[key]} onChange={(event) => updateSchool({ [key]: uppercaseInput(event.target.value) })} />
+              <input value={draft[key]} onChange={(event) => updateDraft({ [key]: uppercaseInput(event.target.value) })} />
             )}
           </label>
         ))}
@@ -6608,7 +6798,7 @@ function SchoolSettings({ school, schoolDirectory, updateSchool, onSave }: { sch
               <h3>Imagens da escola</h3>
               <p>Logo, marca d'água e carimbos usados nos históricos.</p>
             </div>
-            <span>{mediaItems.filter((item) => school[item.key]).length}/{mediaItems.length}</span>
+            <span>{mediaItems.filter((item) => draft[item.key]).length}/{mediaItems.length}</span>
           </div>
           <div className="media-grid">
             {mediaItems.map((item) => (
@@ -6616,18 +6806,33 @@ function SchoolSettings({ school, schoolDirectory, updateSchool, onSave }: { sch
                 key={item.key}
                 title={item.title}
                 description={item.description}
-                value={school[item.key]}
-                onUrlChange={item.url ? (value) => updateSchool({ [item.key]: value }) : undefined}
+                value={draft[item.key]}
+                onUrlChange={item.url ? (value) => updateDraft({ [item.key]: value }) : undefined}
                 onUpload={(file) => uploadSchoolImage(item.key, file)}
-                onRemoveBackground={() => makeSchoolImageTransparent(item.key, school[item.key])}
-                onClear={() => updateSchool({ [item.key]: "" })}
+                onRemoveBackground={() => makeSchoolImageTransparent(item.key, draft[item.key])}
+                onClear={() => updateDraft({ [item.key]: "" })}
               />
             ))}
           </div>
         </section>
       </div>
       <div className="settings-savebar">
-        <button className="primary" type="button" onClick={onSave}>Salvar dados da escola</button>
+        <button
+          className="primary"
+          type="button"
+          disabled={saving}
+          onClick={async () => {
+            if (saving) return;
+            setSaving(true);
+            try {
+              await Promise.resolve(onSave(draft));
+            } finally {
+              setSaving(false);
+            }
+          }}
+        >
+          {saving ? "Salvando..." : "Salvar dados da escola"}
+        </button>
       </div>
     </section>
   );
@@ -7504,15 +7709,13 @@ function DocumentPageOne({ record, school }: { record: HistoryRecord; school: Sc
         <tbody>
           <tr>
             <td rowSpan={14} className="vertical-cell">BASE NACIONAL COMUM 9.394/96</td>
-            <td colSpan={2} className="matrix-head">ÁREAS DE ENSINO<br />COMPONENTES CURRICULARES</td>
+            <td colSpan={2} rowSpan={3} className="matrix-head matrix-left-title">ÁREAS DE ENSINO<br />COMPONENTES CURRICULARES</td>
             <td colSpan={9} className="matrix-head">ANO/PERÍODO LETIVO</td>
           </tr>
           <tr>
-            <td colSpan={2} className="matrix-subhead" />
             {years.map((year) => <td key={`letivo-${year}`} className="matrix-subhead">{printCell(schoolYearFor(record, year))}</td>)}
           </tr>
           <tr>
-            <td colSpan={2} className="matrix-subhead" />
             {printYearLabels.map((label) => <td key={label} className="matrix-subhead">{label}</td>)}
           </tr>
           {matrixGroups.map((group) => (
@@ -7571,9 +7774,15 @@ function DocumentPageTwo({ record, school }: { record: HistoryRecord; school: Sc
   const certificateNext = certificateEnabled ? printCell(record.certificado.prosseguimento) : "";
   const showDirectorStamp = record.usarAssinaturaDiretor && Boolean(school.assinaturaDiretor);
   const showSecretaryStamp = record.usarAssinaturaSecretario && Boolean(school.assinaturaSecretario);
+  const modeloCores = normalizeModelColors(record.modeloCores);
+  const pageTwoStyle = {
+    "--matrix-main-fill": modeloCores.destaque,
+    "--matrix-sub-fill": modeloCores.apoio,
+    "--matrix-border-color": modeloCores.borda,
+  } as CSSProperties;
 
   return (
-    <article className="paper document-page vector-page page-two current-model">
+    <article className="paper document-page vector-page page-two current-model" style={pageTwoStyle}>
       <Watermark school={school} />
 
       <table className="doc-table workload-table">

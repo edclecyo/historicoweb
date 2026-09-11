@@ -20,6 +20,17 @@ const transfersRef = systemRef.collection("transferencias");
 const historiesRef = systemRef.collection("historicos");
 const sessionsRef = systemRef.collection("sessions");
 const activityRef = systemRef.collection("atividades");
+const schoolImagesRef = systemRef.collection("imagens-escolas");
+const schoolImageChunksRef = systemRef.collection("imagens-escolas-partes");
+const imageChunkSize = 180000;
+const schoolImageKeys = [
+  "logoSistema",
+  "logo",
+  "marcaDagua",
+  "carimboEscola",
+  "assinaturaDiretor",
+  "assinaturaSecretario",
+];
 
 function cleanJson(value) {
   return JSON.parse(JSON.stringify(value ?? null));
@@ -84,6 +95,90 @@ function stripPasswordFields(value) {
   return copy;
 }
 
+function splitSchoolProfile(escola = {}) {
+  const profile = { ...cleanJson(escola) };
+  const images = {};
+  for (const key of schoolImageKeys) {
+    if (Object.prototype.hasOwnProperty.call(profile, key)) {
+      images[key] = typeof profile[key] === "string" ? profile[key] : "";
+      delete profile[key];
+    }
+  }
+  return { profile, images };
+}
+
+function imageDocId(schoolId, key) {
+  return `${cleanId(schoolId)}-${key}`;
+}
+
+function imageChunkDocId(schoolId, key, index) {
+  return `${cleanId(schoolId)}-${key}-${String(index).padStart(4, "0")}`;
+}
+
+function imageMapKey(schoolId, key) {
+  return `${schoolId}:${key}`;
+}
+
+function splitImageValue(value) {
+  const text = typeof value === "string" ? value : "";
+  const chunks = [];
+  for (let index = 0; index < text.length; index += imageChunkSize) {
+    chunks.push(text.slice(index, index + imageChunkSize));
+  }
+  return chunks;
+}
+
+async function writeSchoolImage(schoolId, key, value, now = FieldValue.serverTimestamp()) {
+  const cleanSchoolId = cleanId(schoolId);
+  const imageKey = String(key ?? "");
+  if (!schoolImageKeys.includes(imageKey)) throw new HttpsError("invalid-argument", "Imagem inválida.");
+  const chunks = splitImageValue(value);
+  const ref = schoolImagesRef.doc(imageDocId(cleanSchoolId, imageKey));
+  const snapshot = await ref.get();
+  const previousChunkCount = snapshot.exists ? Number(snapshot.get("chunkCount") || 0) : 0;
+  const totalChunks = Math.max(previousChunkCount, chunks.length);
+  const batch = db.batch();
+
+  if (!chunks.length) {
+    batch.delete(ref);
+  } else {
+    batch.set(ref, {
+      schoolId: cleanSchoolId,
+      key: imageKey,
+      chunked: true,
+      chunkCount: chunks.length,
+      updatedAt: now,
+    }, { merge: false });
+  }
+
+  chunks.forEach((chunk, index) => {
+    batch.set(schoolImageChunksRef.doc(imageChunkDocId(cleanSchoolId, imageKey, index)), {
+      schoolId: cleanSchoolId,
+      key: imageKey,
+      index,
+      value: chunk,
+      updatedAt: now,
+    }, { merge: false });
+  });
+
+  for (let index = chunks.length; index < totalChunks; index += 1) {
+    batch.delete(schoolImageChunksRef.doc(imageChunkDocId(cleanSchoolId, imageKey, index)));
+  }
+
+  await batch.commit();
+}
+
+function schoolImageWrites(schoolId, images, now = FieldValue.serverTimestamp()) {
+  return Object.entries(images).map(([key, value]) => writeSchoolImage(schoolId, key, value, now));
+}
+
+async function saveSchoolDoc(schoolId, data) {
+  const ref = schoolsRef.doc(schoolId);
+  const imageDeletePatch = Object.fromEntries(schoolImageKeys.map((key) => [`escola.${key}`, FieldValue.delete()]));
+  await ref.update(imageDeletePatch).catch(() => undefined);
+  await ref.set(data, { merge: true });
+}
+
 function requirePayload(value, message) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new HttpsError("invalid-argument", message);
@@ -94,6 +189,39 @@ function requirePayload(value, message) {
 async function readCollection(ref) {
   const snapshot = await ref.get();
   return snapshot.docs.map((doc) => ({ id: doc.id, ...cleanJson(doc.data()) }));
+}
+
+async function readCollectionWhere(ref, field, value) {
+  const snapshot = await ref.where(field, "==", value).get();
+  return snapshot.docs.map((doc) => ({ id: doc.id, ...cleanJson(doc.data()) }));
+}
+
+async function readSchoolDoc(schoolId) {
+  const snapshot = await schoolsRef.doc(cleanId(schoolId)).get();
+  return snapshot.exists ? [{ id: snapshot.id, ...cleanJson(snapshot.data()) }] : [];
+}
+
+async function readSchoolFolders(schoolId) {
+  const snapshot = await foldersRef.where("schoolId", "==", cleanId(schoolId)).get();
+  return snapshot.docs.map((doc) => ({ id: doc.id, ...cleanJson(doc.data()) }));
+}
+
+async function readSchoolTransfers(schoolId) {
+  const cleanSchoolId = cleanId(schoolId);
+  const [fromSnapshot, toSnapshot] = await Promise.all([
+    transfersRef.where("fromSchoolId", "==", cleanSchoolId).get(),
+    transfersRef.where("toSchoolId", "==", cleanSchoolId).get(),
+  ]);
+  const byId = new Map();
+  for (const doc of [...fromSnapshot.docs, ...toSnapshot.docs]) {
+    byId.set(doc.id, { id: doc.id, ...cleanJson(doc.data()) });
+  }
+  return Array.from(byId.values());
+}
+
+async function readSchoolModel(schoolId) {
+  const snapshot = await modelsRef.doc(cleanId(schoolId)).get();
+  return snapshot.exists ? [{ id: snapshot.id, ...cleanJson(snapshot.data()) }] : [];
 }
 
 async function readLegacyPayload() {
@@ -133,7 +261,7 @@ async function ensureSeparatedDatabase() {
     return;
   }
 
-  await saveFullPayload(legacyPayload, { skipMigrationCheck: true });
+  await saveFullPayload(legacyPayload, { skipMigrationCheck: true, includeWorkspace: true });
   const legacyHistories = await readCollection(historiesRef);
   const batch = db.batch();
   for (const history of [...(legacyPayload.historicos ?? []), ...legacyHistories.map((item) => item.payload ?? item)]) {
@@ -155,17 +283,30 @@ async function readHistories() {
     .map(cleanJson);
 }
 
-async function readData() {
+async function readHistoriesForSchool(schoolId) {
   await ensureSeparatedDatabase();
-  const [configSnapshot, userDocs, schoolDocs, accessDocs, folderDocs, modelDocs, transferDocs, histories] = await Promise.all([
+  const snapshot = await historiesRef.where("payload.schoolId", "==", cleanId(schoolId)).get();
+  return snapshot.docs
+    .filter((item) => item.id.startsWith("historico-"))
+    .map((item) => item.get("payload"))
+    .filter(Boolean)
+    .map(cleanJson);
+}
+
+async function readData(options = {}) {
+  await ensureSeparatedDatabase();
+  const schoolFilter = options.schoolId ? cleanId(options.schoolId) : "";
+  const [configSnapshot, userDocs, schoolDocs, imageDocs, imageChunkDocs, accessDocs, folderDocs, modelDocs, transferDocs, histories] = await Promise.all([
     configRef.get(),
-    readCollection(usersRef),
-    readCollection(schoolsRef),
-    readCollection(schoolAccessesRef),
-    readCollection(foldersRef),
-    readCollection(modelsRef),
-    readCollection(transfersRef),
-    readHistories(),
+    schoolFilter ? Promise.resolve([]) : readCollection(usersRef),
+    schoolFilter ? readSchoolDoc(schoolFilter) : readCollection(schoolsRef),
+    schoolFilter ? readCollectionWhere(schoolImagesRef, "schoolId", schoolFilter) : Promise.resolve([]),
+    schoolFilter ? readCollectionWhere(schoolImageChunksRef, "schoolId", schoolFilter) : Promise.resolve([]),
+    schoolFilter ? readCollectionWhere(schoolAccessesRef, "schoolId", schoolFilter) : readCollection(schoolAccessesRef),
+    schoolFilter ? readSchoolFolders(schoolFilter) : Promise.resolve([]),
+    schoolFilter ? readSchoolModel(schoolFilter) : Promise.resolve([]),
+    schoolFilter ? readSchoolTransfers(schoolFilter) : Promise.resolve([]),
+    schoolFilter ? readHistoriesForSchool(schoolFilter) : Promise.resolve([]),
   ]);
 
   const owner = userDocs.find((user) => user.role === "owner" || user.id === "owner");
@@ -188,6 +329,28 @@ async function readData() {
     });
     accessBySchool.set(schoolId, list);
   }
+  const imagesBySchool = new Map();
+  const chunksByImage = new Map();
+  for (const chunk of imageChunkDocs) {
+    if (!chunk.schoolId || !schoolImageKeys.includes(chunk.key) || typeof chunk.value !== "string") continue;
+    const index = Number(chunk.index);
+    if (!Number.isFinite(index)) continue;
+    const mapKey = imageMapKey(chunk.schoolId, chunk.key);
+    const current = chunksByImage.get(mapKey) ?? [];
+    current.push({ index, value: chunk.value });
+    chunksByImage.set(mapKey, current);
+  }
+  for (const image of imageDocs) {
+    if (!image.schoolId || !schoolImageKeys.includes(image.key)) continue;
+    const orderedChunks = chunksByImage.get(imageMapKey(image.schoolId, image.key));
+    const value = orderedChunks?.length
+      ? orderedChunks.sort((a, b) => a.index - b.index).map((chunk) => chunk.value).join("")
+      : typeof image.value === "string" ? image.value : "";
+    if (!value) continue;
+    const current = imagesBySchool.get(image.schoolId) ?? {};
+    current[image.key] = value;
+    imagesBySchool.set(image.schoolId, current);
+  }
 
   const escolas = schoolDocs.map((school) => {
     const accessos = (accessBySchool.get(school.id) ?? [])
@@ -201,9 +364,11 @@ async function readData() {
       senha: passwordMask,
       tipo: school.tipo || "municipal",
       ativo: school.ativo ?? true,
-      escola: school.escola ?? {},
+      escola: { ...(school.escola ?? {}), ...(imagesBySchool.get(school.id) ?? {}) },
       createdAt: school.createdAt || new Date().toISOString(),
       mustChangePassword: primaryAccess?.mustChangePassword ?? false,
+      turmasCount: Number(school.turmasCount || 0),
+      historicosCount: Number(school.historicosCount || 0),
       accessos,
     };
   });
@@ -244,18 +409,20 @@ async function saveFullPayload(payload, options = {}) {
   if (!options.skipMigrationCheck) await ensureSeparatedDatabase();
   const data = requirePayload(payload, "Dados inválidos.");
   const now = FieldValue.serverTimestamp();
-  const [existingUsers, existingAccesses, currentUsers, currentSchools, currentAccesses, currentFolders, currentModels, currentTransfers] = await Promise.all([
+  const includeWorkspace = options.includeWorkspace === true || data.__includeWorkspace === true;
+  const [existingUsers, existingAccesses, currentSchools, currentAccesses, currentFolders, currentModels, currentTransfers] = await Promise.all([
     readCollection(usersRef),
     readCollection(schoolAccessesRef),
-    readCollection(usersRef),
     readCollection(schoolsRef),
     readCollection(schoolAccessesRef),
-    readCollection(foldersRef),
-    readCollection(modelsRef),
-    readCollection(transfersRef),
+    includeWorkspace ? readCollection(foldersRef) : Promise.resolve([]),
+    includeWorkspace ? readCollection(modelsRef) : Promise.resolve([]),
+    includeWorkspace ? readCollection(transfersRef) : Promise.resolve([]),
   ]);
+  const currentUsers = existingUsers;
   const existingUsersById = new Map(existingUsers.map((item) => [item.id, item]));
   const existingAccessesByKey = new Map(existingAccesses.map((item) => [`${item.schoolId}:${item.accessId || item.id}`, item]));
+  const currentSchoolsById = new Map(currentSchools.map((item) => [item.id, item]));
   const writes = [];
   const keepUserIds = new Set(["owner"]);
   const keepSchoolIds = new Set();
@@ -303,15 +470,26 @@ async function saveFullPayload(payload, options = {}) {
   for (const school of data.escolas ?? []) {
     const schoolId = cleanId(school.id);
     keepSchoolIds.add(schoolId);
+    const existingSchool = currentSchoolsById.get(schoolId) ?? {};
+    const { profile, images } = splitSchoolProfile(school.escola ?? {});
     const accessos = normalizedSchoolAccesses(school.accessos, { id: `${schoolId}-principal`, usuario: school.usuario, senha: school.senha, nivel: "principal", mustChangePassword: school.mustChangePassword });
-    writes.push(schoolsRef.doc(schoolId).set({
+    const turmasCount = includeWorkspace
+      ? (data.folders ?? []).filter((folder) => folder?.schoolId === schoolId).length
+      : Number(school.turmasCount ?? existingSchool.turmasCount ?? 0);
+    const historicosCount = includeWorkspace
+      ? (data.historicos ?? []).filter((history) => history?.schoolId === schoolId).length
+      : Number(school.historicosCount ?? existingSchool.historicosCount ?? 0);
+    writes.push(saveSchoolDoc(schoolId, {
       id: schoolId,
       tipo: school.tipo || "municipal",
       ativo: school.ativo ?? true,
-      escola: cleanJson(school.escola ?? {}),
+      escola: cleanJson(profile),
+      turmasCount,
+      historicosCount,
       createdAt: school.createdAt || new Date().toISOString(),
       updatedAt: now,
-    }, { merge: true }));
+    }));
+    writes.push(...schoolImageWrites(schoolId, images, now));
     for (const access of accessos) {
       const accessId = cleanId(access.id || `${schoolId}-principal`);
       const docId = accessDocId(schoolId, accessId);
@@ -334,31 +512,33 @@ async function saveFullPayload(payload, options = {}) {
     }
   }
 
-  for (const folder of data.folders ?? []) {
-    const id = cleanId(folder.id);
-    keepFolderIds.add(id);
-    writes.push(foldersRef.doc(id).set({ ...cleanJson(folder), updatedAt: now }, { merge: true }));
-  }
+  if (includeWorkspace) {
+    for (const folder of data.folders ?? []) {
+      const id = cleanId(folder.id);
+      keepFolderIds.add(id);
+      writes.push(foldersRef.doc(id).set({ ...cleanJson(folder), updatedAt: now }, { merge: true }));
+    }
 
-  for (const [schoolId, model] of Object.entries(data.modelos ?? {})) {
-    const id = cleanId(schoolId);
-    keepModelIds.add(id);
-    writes.push(modelsRef.doc(id).set({
-      ...cleanJson(model),
-      schoolId: id,
-      updatedAt: now,
-    }, { merge: true }));
-  }
+    for (const [schoolId, model] of Object.entries(data.modelos ?? {})) {
+      const id = cleanId(schoolId);
+      keepModelIds.add(id);
+      writes.push(modelsRef.doc(id).set({
+        ...cleanJson(model),
+        schoolId: id,
+        updatedAt: now,
+      }, { merge: true }));
+    }
 
-  for (const transfer of data.transferencias ?? []) {
-    const id = cleanId(transfer.id);
-    keepTransferIds.add(id);
-    writes.push(transfersRef.doc(id).set({ ...cleanJson(transfer), updatedAt: now }, { merge: true }));
-  }
+    for (const transfer of data.transferencias ?? []) {
+      const id = cleanId(transfer.id);
+      keepTransferIds.add(id);
+      writes.push(transfersRef.doc(id).set({ ...cleanJson(transfer), updatedAt: now }, { merge: true }));
+    }
 
-  for (const history of data.historicos ?? []) {
-    if (!history?.id) continue;
-    writes.push(historiesRef.doc(`historico-${cleanId(history.id)}`).set({ payload: cleanJson(history), updatedAt: now }, { merge: true }));
+    for (const history of data.historicos ?? []) {
+      if (!history?.id) continue;
+      writes.push(historiesRef.doc(`historico-${cleanId(history.id)}`).set({ payload: cleanJson(history), updatedAt: now }, { merge: true }));
+    }
   }
 
   for (const item of currentUsers) {
@@ -371,19 +551,23 @@ async function saveFullPayload(payload, options = {}) {
   for (const item of currentAccesses) {
     if (!keepAccessIds.has(item.id)) writes.push(schoolAccessesRef.doc(item.id).delete());
   }
-  for (const item of currentFolders) {
-    if (!keepFolderIds.has(item.id)) writes.push(foldersRef.doc(item.id).delete());
-  }
-  for (const item of currentModels) {
-    if (!keepModelIds.has(item.id)) writes.push(modelsRef.doc(item.id).delete());
-  }
-  for (const item of currentTransfers) {
-    if (!keepTransferIds.has(item.id)) writes.push(transfersRef.doc(item.id).delete());
+  if (includeWorkspace) {
+    for (const item of currentFolders) {
+      if (!keepFolderIds.has(item.id)) writes.push(foldersRef.doc(item.id).delete());
+    }
+    for (const item of currentModels) {
+      if (!keepModelIds.has(item.id)) writes.push(modelsRef.doc(item.id).delete());
+    }
+    for (const item of currentTransfers) {
+      if (!keepTransferIds.has(item.id)) writes.push(transfersRef.doc(item.id).delete());
+    }
   }
 
+  const configSchool = data.escola ?? data.escolas?.[0]?.escola ?? null;
+  const { profile: configProfile } = configSchool ? splitSchoolProfile(configSchool) : { profile: null };
   writes.push(configRef.set({
     databaseModel: "separated-v2",
-    escola: cleanJson(data.escola ?? data.escolas?.[0]?.escola ?? null),
+    escola: cleanJson(configProfile),
     updatedAt: now,
   }, { merge: true }));
   writes.push(systemRef.set({ databaseModel: "separated-v2", payload: FieldValue.delete(), updatedAt: now }, { merge: true }));
@@ -396,17 +580,21 @@ async function saveSchoolPayload(payload, session) {
   const incoming = requirePayload(payload, "Dados inválidos.");
   const incomingSchool = (incoming.escolas ?? []).find((school) => school.id === schoolId);
   if (incomingSchool) {
-    await schoolsRef.doc(schoolId).set({
+    const { profile, images } = splitSchoolProfile(incomingSchool.escola ?? {});
+    await Promise.all([
+      saveSchoolDoc(schoolId, {
       id: schoolId,
       tipo: incomingSchool.tipo || "municipal",
       ativo: incomingSchool.ativo ?? true,
-      escola: cleanJson(incomingSchool.escola ?? {}),
+      escola: cleanJson(profile),
       createdAt: incomingSchool.createdAt || new Date().toISOString(),
       updatedAt: FieldValue.serverTimestamp(),
-    }, { merge: true });
+      }),
+      ...schoolImageWrites(schoolId, images),
+    ]);
   }
 
-  const currentTransfers = await readCollection(transfersRef);
+  const currentTransfers = await readSchoolTransfers(schoolId);
   const incomingTransfers = (incoming.transferencias ?? []).filter((request) =>
     request.fromSchoolId === schoolId || request.toSchoolId === schoolId,
   );
@@ -530,19 +718,18 @@ function cleanActivityDoc(doc) {
 
 async function readActiveUsers() {
   const cutoff = Date.now() - 1000 * 60 * 4;
-  const [sessionSnapshot, schools] = await Promise.all([sessionsRef.get(), readCollection(schoolsRef)]);
+  const sessionSnapshot = await sessionsRef.get();
   return sessionSnapshot.docs
     .map((doc) => ({ id: doc.id, ...cleanJson(doc.data()) }))
     .filter((session) => session.role !== "owner" && session.lastSeen && session.lastSeen >= cutoff && (!session.expiresAt || session.expiresAt >= Date.now()))
     .map((session) => {
-      const school = schools.find((item) => item.id === session.schoolId);
       return {
         id: session.id,
         usuario: normalizeText(session.nome || ""),
         perfil: session.role || "school",
         perfilNome: roleLabel(session),
         schoolId: session.schoolId || "",
-        schoolName: session.schoolName || normalizeText(school?.escola?.nome || ""),
+        schoolName: session.schoolName || "",
         currentView: session.currentView || "",
         actionLabel: session.actionLabel || "Online agora",
         targetName: normalizeText(session.targetName || ""),
@@ -596,7 +783,11 @@ async function findSchoolAccess(credentials) {
   const senha = String(credentials?.senha ?? "").trim();
   const tipo = String(credentials?.tipo ?? "");
   if (!usuario || !senha || !["municipal", "estadual", "privada"].includes(tipo)) return null;
-  const [schools, accesses] = await Promise.all([readCollection(schoolsRef), readCollection(schoolAccessesRef)]);
+  const accessSnapshot = await schoolAccessesRef.where("usuario", "==", usuario).get();
+  let accesses = accessSnapshot.docs.map((doc) => ({ id: doc.id, ...cleanJson(doc.data()) }));
+  if (!accesses.length) {
+    accesses = (await readCollection(schoolAccessesRef)).filter((access) => normalizeText(access.usuario) === usuario);
+  }
   const normalizedAccesses = accesses
     .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)))
     .map((access, index, list) => {
@@ -604,13 +795,24 @@ async function findSchoolAccess(credentials) {
       const fallbackLevel = sameSchoolBefore ? "secundario" : "principal";
       return { ...access, nivel: access.nivel === "principal" ? "principal" : access.nivel === "secundario" ? "secundario" : fallbackLevel };
     });
+  const matches = [];
   for (const access of normalizedAccesses) {
-    if (access.usuario !== usuario || access.tipo !== tipo || access.ativo === false || !verifyPassword(senha, access)) continue;
-    const school = schools.find((item) => item.id === access.schoolId && item.ativo !== false && item.tipo === tipo);
-    if (!school) continue;
-    return { role: "school", nome: access.usuario, schoolId: school.id, accessId: access.accessId || access.id, accessLevel: access.nivel === "principal" ? "principal" : "secundario" };
+    if (normalizeText(access.usuario) !== usuario || access.ativo === false || !verifyPassword(senha, access)) continue;
+    const schoolSnapshot = await schoolsRef.doc(cleanId(access.schoolId)).get();
+    const school = schoolSnapshot.exists ? { id: schoolSnapshot.id, ...cleanJson(schoolSnapshot.data()) } : null;
+    const schoolType = school?.tipo || access.tipo || "municipal";
+    if (!school || school.ativo === false) continue;
+    matches.push({ access, school, schoolType });
   }
-  return null;
+  const selected = matches.find((match) => match.schoolType === tipo) ?? (matches.length === 1 ? matches[0] : null);
+  if (!selected) return null;
+  return {
+    role: "school",
+    nome: selected.access.usuario,
+    schoolId: selected.school.id,
+    accessId: selected.access.accessId || selected.access.id,
+    accessLevel: selected.access.nivel === "principal" ? "principal" : "secundario",
+  };
 }
 
 function patchOwnVisiblePassword(data, session, password) {
@@ -692,19 +894,31 @@ exports.recoverSchoolPassword = onCall({ region }, async (request) => {
   if (!usuario || !email || cpf.length !== 11 || !["municipal", "estadual", "privada"].includes(tipo)) {
     throw new HttpsError("invalid-argument", "Informe rede, Login, E-mail e CPF.");
   }
-  const [schools, accesses] = await Promise.all([
-    readCollection(schoolsRef),
-    readCollection(schoolAccessesRef),
-  ]);
-  const found = accesses.find((access) => {
-    const school = schools.find((item) => item.id === access.schoolId);
-    return access.ativo !== false &&
-      school?.ativo !== false &&
-      access.tipo === tipo &&
-      access.usuario === usuario &&
+  const accessSnapshot = await schoolAccessesRef.where("usuario", "==", usuario).get();
+  let accesses = accessSnapshot.docs.map((doc) => ({ id: doc.id, ...cleanJson(doc.data()) }));
+  if (!accesses.length) {
+    accesses = (await readCollection(schoolAccessesRef)).filter((access) => normalizeText(access.usuario) === usuario);
+  }
+  let found = null;
+  for (const access of accesses) {
+    if (
+      access.ativo !== false &&
+      normalizeText(access.usuario) === usuario &&
       normalizeEmail(access.email) === email &&
-      digitsOnly(access.cpf) === cpf;
-  });
+      digitsOnly(access.cpf) === cpf
+    ) {
+      const schoolSnapshot = await schoolsRef.doc(cleanId(access.schoolId)).get();
+      const school = schoolSnapshot.exists ? { id: schoolSnapshot.id, ...cleanJson(schoolSnapshot.data()) } : null;
+      const schoolType = school?.tipo || access.tipo || "municipal";
+      if (
+        school?.ativo !== false &&
+        schoolType === tipo
+      ) {
+        found = access;
+        break;
+      }
+    }
+  }
   if (!found) {
     throw new HttpsError("permission-denied", "Dados não encontrados.");
   }
@@ -722,7 +936,7 @@ exports.loginSchool = onCall({ region }, async (request) => {
   const access = await findSchoolAccess(request.data);
   if (!access) throw new HttpsError("permission-denied", "Usuário, senha ou rede da escola incorretos.");
   const session = await issueSession(access);
-  const data = patchOwnVisiblePassword(await readData(), session, senha);
+  const data = patchOwnVisiblePassword(await readData({ schoolId: access.schoolId }), session, senha);
   return { session, ...viewForSession(data, access) };
 });
 
@@ -795,7 +1009,7 @@ exports.updateProfile = onCall({ region }, async (request) => {
 
 exports.loadSystemState = onCall({ region }, async (request) => {
   const session = await requireSession(request);
-  const data = await readData();
+  const data = await readData(session.role === "school" && session.schoolId ? { schoolId: session.schoolId } : {});
   return { payload: viewForSession(data, session).payload };
 });
 
@@ -863,8 +1077,102 @@ exports.saveSystemState = onCall({ region }, async (request) => {
   return { ok: true };
 });
 
+exports.saveSchoolProfile = onCall({ region }, async (request) => {
+  const session = await requireSession(request);
+  if (session.role !== "school" || !session.schoolId) throw new HttpsError("permission-denied", "Acesso não autorizado.");
+  const schoolId = cleanId(session.schoolId);
+  const profile = requirePayload(request.data?.profile, "Dados da escola inválidos.");
+  const { profile: cleanProfile } = splitSchoolProfile(profile);
+  const currentSnapshot = await schoolsRef.doc(schoolId).get();
+  const current = currentSnapshot.exists ? currentSnapshot.data() : {};
+  await saveSchoolDoc(schoolId, {
+    id: schoolId,
+    tipo: current.tipo || "municipal",
+    ativo: current.ativo ?? true,
+    escola: cleanJson(cleanProfile),
+    createdAt: current.createdAt || new Date().toISOString(),
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+  return { ok: true };
+});
+
+exports.saveSchoolImage = onCall({ region }, async (request) => {
+  const session = await requireSession(request);
+  if (session.role !== "school" || !session.schoolId) throw new HttpsError("permission-denied", "Acesso não autorizado.");
+  const key = String(request.data?.key ?? "");
+  if (!schoolImageKeys.includes(key)) throw new HttpsError("invalid-argument", "Imagem inválida.");
+  const value = String(request.data?.value ?? "");
+  await Promise.all(schoolImageWrites(cleanId(session.schoolId), { [key]: value }));
+  return { ok: true };
+});
+
+exports.saveSchoolWorkspace = onCall({ region }, async (request) => {
+  const session = await requireSession(request);
+  if (session.role !== "school" || !session.schoolId) throw new HttpsError("permission-denied", "Acesso não autorizado.");
+  const schoolId = cleanId(session.schoolId);
+  const payload = requirePayload(request.data?.payload, "Dados inválidos.");
+  const school = payload.escola?.id === schoolId ? payload.escola : null;
+  const folders = Array.isArray(payload.folders) ? payload.folders.filter((folder) => folder?.schoolId === schoolId) : [];
+  const transfers = Array.isArray(payload.transferencias)
+    ? payload.transferencias.filter((transfer) => transfer?.fromSchoolId === schoolId || transfer?.toSchoolId === schoolId)
+    : [];
+  const now = FieldValue.serverTimestamp();
+
+  const [currentFolders, currentTransfers] = await Promise.all([
+    readSchoolFolders(schoolId),
+    readSchoolTransfers(schoolId),
+  ]);
+  const keepFolderIds = new Set(folders.map((folder) => cleanId(folder.id)));
+  const keepTransferIds = new Set(transfers.map((transfer) => cleanId(transfer.id)));
+  const writes = [];
+
+  if (school?.escola) {
+    const currentSnapshot = await schoolsRef.doc(schoolId).get();
+    const current = currentSnapshot.exists ? currentSnapshot.data() : {};
+    const { profile } = splitSchoolProfile(school.escola);
+    writes.push(saveSchoolDoc(schoolId, {
+      id: schoolId,
+      tipo: current.tipo || school.tipo || "municipal",
+      ativo: current.ativo ?? school.ativo ?? true,
+      escola: cleanJson(profile),
+      createdAt: current.createdAt || school.createdAt || new Date().toISOString(),
+      updatedAt: now,
+    }));
+  }
+
+  for (const folder of folders) {
+    writes.push(foldersRef.doc(cleanId(folder.id)).set({ ...cleanJson(folder), updatedAt: now }, { merge: true }));
+  }
+  for (const folder of currentFolders) {
+    if (folder.schoolId === schoolId && !keepFolderIds.has(folder.id)) writes.push(foldersRef.doc(cleanId(folder.id)).delete());
+  }
+  writes.push(schoolsRef.doc(schoolId).set({
+    turmasCount: folders.length,
+    updatedAt: now,
+  }, { merge: true }));
+
+  if (payload.modelo && session.accessLevel === "principal") {
+    writes.push(modelsRef.doc(schoolId).set({ ...cleanJson(payload.modelo), schoolId, updatedAt: now }, { merge: true }));
+  }
+
+  for (const transfer of transfers) {
+    writes.push(transfersRef.doc(cleanId(transfer.id)).set({ ...cleanJson(transfer), updatedAt: now }, { merge: true }));
+  }
+  for (const transfer of currentTransfers) {
+    if ((transfer.fromSchoolId === schoolId || transfer.toSchoolId === schoolId) && !keepTransferIds.has(transfer.id)) {
+      writes.push(transfersRef.doc(cleanId(transfer.id)).delete());
+    }
+  }
+
+  await Promise.all(writes);
+  return { ok: true };
+});
+
 exports.loadHistories = onCall({ region }, async (request) => {
   const session = await requireSession(request);
+  if (session.role === "school" && session.schoolId) {
+    return { histories: await readHistoriesForSchool(session.schoolId) };
+  }
   const data = await readData();
   return { histories: viewForSession(data, session).histories };
 });
@@ -876,7 +1184,19 @@ exports.saveHistory = onCall({ region }, async (request) => {
   if (!isPrivileged(session) && payload.schoolId !== session.schoolId) {
     throw new HttpsError("permission-denied", "Histórico de outra escola.");
   }
-  await historiesRef.doc(`historico-${id}`).set({ payload, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+  const schoolId = payload.schoolId ? cleanId(payload.schoolId) : "";
+  const ref = historiesRef.doc(`historico-${id}`);
+  const snapshot = await ref.get();
+  const previousSchoolId = snapshot.exists ? String(snapshot.get("payload.schoolId") || "") : "";
+  await ref.set({ payload, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+  if (schoolId && !snapshot.exists) {
+    await schoolsRef.doc(schoolId).set({ historicosCount: FieldValue.increment(1) }, { merge: true });
+  } else if (schoolId && previousSchoolId && previousSchoolId !== schoolId) {
+    await Promise.all([
+      schoolsRef.doc(cleanId(previousSchoolId)).set({ historicosCount: FieldValue.increment(-1) }, { merge: true }),
+      schoolsRef.doc(schoolId).set({ historicosCount: FieldValue.increment(1) }, { merge: true }),
+    ]);
+  }
   return { ok: true };
 });
 
@@ -898,13 +1218,19 @@ exports.saveHistories = onCall({ region }, async (request) => {
 exports.deleteHistory = onCall({ region }, async (request) => {
   const session = await requireSession(request);
   const id = cleanId(request.data?.id);
+  let schoolId = "";
   if (!isPrivileged(session)) {
     const snapshot = await historiesRef.doc(`historico-${id}`).get();
     const payload = snapshot.exists ? snapshot.get("payload") : null;
     if (payload?.schoolId !== session.schoolId) {
       throw new HttpsError("permission-denied", "Histórico de outra escola.");
     }
+    schoolId = payload?.schoolId || "";
+  } else {
+    const snapshot = await historiesRef.doc(`historico-${id}`).get();
+    schoolId = snapshot.exists ? String(snapshot.get("payload.schoolId") || "") : "";
   }
   await historiesRef.doc(`historico-${id}`).delete();
+  if (schoolId) await schoolsRef.doc(cleanId(schoolId)).set({ historicosCount: FieldValue.increment(-1) }, { merge: true });
   return { ok: true };
 });
