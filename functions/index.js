@@ -50,7 +50,7 @@ function digitsOnly(value) {
 
 function cleanId(value) {
   const id = String(value ?? "").trim();
-  if (!id || /[\/\\]/.test(id)) throw new HttpsError("invalid-argument", "Registro inválido.");
+  if (!id || /[/\\]/.test(id)) throw new HttpsError("invalid-argument", "Registro inválido.");
   return id;
 }
 
@@ -271,16 +271,6 @@ async function ensureSeparatedDatabase() {
   batch.set(configRef, { databaseModel: "separated-v2", migratedAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() }, { merge: true });
   batch.set(systemRef, { databaseModel: "separated-v2", payload: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() }, { merge: true });
   await batch.commit();
-}
-
-async function readHistories() {
-  await ensureSeparatedDatabase();
-  const snapshot = await historiesRef.get();
-  return snapshot.docs
-    .filter((item) => item.id.startsWith("historico-"))
-    .map((item) => item.get("payload"))
-    .filter(Boolean)
-    .map(cleanJson);
 }
 
 async function readHistoriesForSchool(schoolId) {

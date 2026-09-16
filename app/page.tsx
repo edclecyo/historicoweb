@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
+import { Fragment, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type FormEvent, type InputHTMLAttributes, type ReactNode } from "react";
 import {
   changeCloudPassword,
   createCloudOwner,
@@ -349,31 +349,8 @@ type HistoryQrValue =
   | { kind: "id"; id: string; codigo?: string }
   | { kind: "record"; record: HistoryRecord };
 
-type FileWriterLike = {
-  write: (content: string) => Promise<void>;
-  close: () => Promise<void>;
-};
-
-type FileHandleLike = {
-  kind: "file";
-  name: string;
-  getFile: () => Promise<File>;
-  createWritable: () => Promise<FileWriterLike>;
-};
-
-type DirectoryHandleLike = {
-  kind: "directory";
-  name: string;
-  getFileHandle: (name: string, options?: { create?: boolean }) => Promise<FileHandleLike>;
-  getDirectoryHandle: (name: string, options?: { create?: boolean }) => Promise<DirectoryHandleLike>;
-  entries: () => AsyncIterableIterator<[string, FileHandleLike | DirectoryHandleLike]>;
-};
-
-type DirectoryPickerWindow = Window & typeof globalThis & {
-  showDirectoryPicker?: (options?: { mode?: "read" | "readwrite" }) => Promise<DirectoryHandleLike>;
-};
-
 const years = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+const recordsPageSize = 25;
 
 const steps = [
   "Aluno",
@@ -438,13 +415,6 @@ const matrixSeed: ComponentRow[] = [
   { id: "projeto-caminhar", area: "Parte Diversificada", nome: "Projeto Caminhar", inicio: 1, fim: 9, avaliativo: true },
   { id: "valorizacao-cultural", area: "Parte Diversificada", nome: "Valorizacao Cultural, Historica e Geografica Brejo Santo", inicio: 1, fim: 9, avaliativo: true },
   { id: "estudo-orientado", area: "Parte Diversificada", nome: "Estudo Orientado", inicio: 1, fim: 9, avaliativo: false },
-];
-
-const areaOptions: Area[] = [
-  "Linguagens e Codigos",
-  "Cultura e Sociedade",
-  "Ciencias Naturais e Matematica",
-  "Parte Diversificada",
 ];
 
 const defaultModelColors: HistoryModelColors = {
@@ -515,7 +485,7 @@ function initialsFor(value: string) {
   return `${parts[0]?.[0] ?? ""}${parts.length > 1 ? parts[parts.length - 1]?.[0] ?? "" : ""}` || "U";
 }
 
-function upper(value: string) {
+function upper(value?: string | null) {
   return value ? value.toLocaleUpperCase("pt-BR") : "";
 }
 
@@ -541,11 +511,22 @@ function uppercaseInput(value: string) {
   return value.toLocaleUpperCase("pt-BR");
 }
 
-function digitsOnly(value: string) {
+function digitsOnly(value?: string | null) {
   return String(value ?? "").replace(/\D/g, "");
 }
 
-function formatCpf(value: string) {
+function normalizeStudentCensusId(value: string) {
+  return digitsOnly(value);
+}
+
+function studentCensusIdError(value: string) {
+  const digits = normalizeStudentCensusId(value);
+  if (!digits) return "";
+  if (digits.length !== 12) return `ID do aluno inválido: devem ser 12 números. Atual: ${digits.length}/12.`;
+  return "";
+}
+
+function formatCpf(value?: string | null) {
   const digits = digitsOnly(value).slice(0, 11);
   return digits
     .replace(/^(\d{3})(\d)/, "$1.$2")
@@ -553,7 +534,7 @@ function formatCpf(value: string) {
     .replace(/\.(\d{3})(\d)/, ".$1-$2");
 }
 
-function normalizeEmail(value: string) {
+function normalizeEmail(value?: string | null) {
   return String(value ?? "").trim().toLocaleLowerCase("pt-BR");
 }
 
@@ -616,7 +597,7 @@ function safeUpperFileName(value: string) {
 
 function safePdfTitle(value: string) {
   return (upper(value).trim() || "HISTORICO")
-    .replace(/[<>:"/\\|?*\u0000-\u001f]+/g, " ")
+    .replace(/[<>:"/\\|?*]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -628,6 +609,183 @@ function printWithTitle(title: string) {
   window.setTimeout(() => {
     document.title = previousTitle;
   }, 600);
+}
+
+function crc32(bytes: Uint8Array) {
+  let crc = -1;
+  for (const byte of bytes) {
+    crc = (crc >>> 8) ^ crcTable[(crc ^ byte) & 0xff];
+  }
+  return (crc ^ -1) >>> 0;
+}
+
+const crcTable = Array.from({ length: 256 }, (_, index) => {
+  let value = index;
+  for (let bit = 0; bit < 8; bit += 1) {
+    value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+  }
+  return value >>> 0;
+});
+
+function zipDateTime(date = new Date()) {
+  const time = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
+  const day = date.getDate();
+  const month = date.getMonth() + 1;
+  const year = Math.max(1980, date.getFullYear()) - 1980;
+  return { time, date: (year << 9) | (month << 5) | day };
+}
+
+function writeUint16(target: Uint8Array, offset: number, value: number) {
+  target[offset] = value & 0xff;
+  target[offset + 1] = (value >>> 8) & 0xff;
+}
+
+function writeUint32(target: Uint8Array, offset: number, value: number) {
+  target[offset] = value & 0xff;
+  target[offset + 1] = (value >>> 8) & 0xff;
+  target[offset + 2] = (value >>> 16) & 0xff;
+  target[offset + 3] = (value >>> 24) & 0xff;
+}
+
+function concatBytes(parts: Uint8Array[]) {
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+function createZip(files: Array<{ path: string; content: Uint8Array }>) {
+  const encoder = new TextEncoder();
+  const now = zipDateTime();
+  const localParts: Uint8Array[] = [];
+  const centralParts: Uint8Array[] = [];
+  let offset = 0;
+
+  for (const file of files) {
+    const name = encoder.encode(file.path);
+    const data = file.content;
+    const crc = crc32(data);
+    const local = new Uint8Array(30 + name.length);
+    writeUint32(local, 0, 0x04034b50);
+    writeUint16(local, 4, 20);
+    writeUint16(local, 6, 0x0800);
+    writeUint16(local, 8, 0);
+    writeUint16(local, 10, now.time);
+    writeUint16(local, 12, now.date);
+    writeUint32(local, 14, crc);
+    writeUint32(local, 18, data.length);
+    writeUint32(local, 22, data.length);
+    writeUint16(local, 26, name.length);
+    local.set(name, 30);
+    localParts.push(local, data);
+
+    const central = new Uint8Array(46 + name.length);
+    writeUint32(central, 0, 0x02014b50);
+    writeUint16(central, 4, 20);
+    writeUint16(central, 6, 20);
+    writeUint16(central, 8, 0x0800);
+    writeUint16(central, 10, 0);
+    writeUint16(central, 12, now.time);
+    writeUint16(central, 14, now.date);
+    writeUint32(central, 16, crc);
+    writeUint32(central, 20, data.length);
+    writeUint32(central, 24, data.length);
+    writeUint16(central, 28, name.length);
+    writeUint32(central, 42, offset);
+    central.set(name, 46);
+    centralParts.push(central);
+    offset += local.length + data.length;
+  }
+
+  const centralDirectory = concatBytes(centralParts);
+  const end = new Uint8Array(22);
+  writeUint32(end, 0, 0x06054b50);
+  writeUint16(end, 8, files.length);
+  writeUint16(end, 10, files.length);
+  writeUint32(end, 12, centralDirectory.length);
+  writeUint32(end, 16, offset);
+  return concatBytes([...localParts, centralDirectory, end]);
+}
+
+function dataUrlBytes(dataUrl: string) {
+  const base64 = dataUrl.split(",")[1] || "";
+  const binary = window.atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function textBytes(value: string) {
+  return new TextEncoder().encode(value);
+}
+
+function createPdfFromJpegs(pages: Array<{ dataUrl: string; width: number; height: number }>) {
+  const objects: Uint8Array[] = [];
+  const pageObjectIds: number[] = [];
+  const pageWidth = 595.28;
+  const pageHeight = 841.89;
+
+  objects.push(textBytes("<< /Type /Catalog /Pages 2 0 R >>"));
+  objects.push(textBytes(""));
+
+  pages.forEach((page, index) => {
+    const pageObjectId = objects.length + 1;
+    const contentObjectId = pageObjectId + 1;
+    const imageObjectId = pageObjectId + 2;
+    pageObjectIds.push(pageObjectId);
+    objects.push(textBytes(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Resources << /XObject << /Im${index + 1} ${imageObjectId} 0 R >> >> /Contents ${contentObjectId} 0 R >>`));
+    const command = `q ${pageWidth} 0 0 ${pageHeight} 0 0 cm /Im${index + 1} Do Q`;
+    objects.push(textBytes(`<< /Length ${command.length} >>\nstream\n${command}\nendstream`));
+    const imageBytes = dataUrlBytes(page.dataUrl);
+    objects.push(concatBytes([
+      textBytes(`<< /Type /XObject /Subtype /Image /Width ${page.width} /Height ${page.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${imageBytes.length} >>\nstream\n`),
+      imageBytes,
+      textBytes("\nendstream"),
+    ]));
+  });
+
+  objects[1] = textBytes(`<< /Type /Pages /Kids [${pageObjectIds.map((id) => `${id} 0 R`).join(" ")}] /Count ${pageObjectIds.length} >>`);
+  const parts: Uint8Array[] = [textBytes("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n")];
+  const offsets = [0];
+  for (let index = 0; index < objects.length; index += 1) {
+    const prefix = textBytes(`${index + 1} 0 obj\n`);
+    const suffix = textBytes("\nendobj\n");
+    offsets.push(parts.reduce((sum, part) => sum + part.length, 0));
+    parts.push(prefix, objects[index], suffix);
+  }
+  const xrefOffset = parts.reduce((sum, part) => sum + part.length, 0);
+  const xref = [
+    "xref",
+    `0 ${objects.length + 1}`,
+    "0000000000 65535 f ",
+    ...offsets.slice(1).map((offset) => `${String(offset).padStart(10, "0")} 00000 n `),
+    "trailer",
+    `<< /Size ${objects.length + 1} /Root 1 0 R >>`,
+    "startxref",
+    String(xrefOffset),
+    "%%EOF",
+  ].join("\n");
+  parts.push(textBytes(xref));
+  return concatBytes(parts);
+}
+
+function downloadBytes(bytes: Uint8Array, fileName: string, type: string) {
+  const body = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  const blob = new Blob([body], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
 
 const ibgeBaseUrl = "https://servicodados.ibge.gov.br/api/v1/localidades";
@@ -874,23 +1032,22 @@ function parseSchoolDirectoryFeatures(payload: unknown): SchoolDirectoryItem[] {
     : [];
   if (!Array.isArray(features)) return [];
   return features
-    .map((feature) => {
+    .flatMap((feature) => {
       const attributes = typeof feature === "object" && feature && "attributes" in feature
         ? (feature as { attributes?: unknown }).attributes
         : null;
-      if (!attributes || typeof attributes !== "object") return null;
+      if (!attributes || typeof attributes !== "object") return [];
       const attrs = attributes as Record<string, unknown>;
       const nome = readDirectoryText(attrs, ["Escola", "escola", "NO_ENTIDADE", "nome"]);
-      if (!nome) return null;
-      return {
+      if (!nome) return [];
+      return [{
         nome,
         codigo: readDirectoryText(attrs, ["Código_INEP", "Codigo_INEP", "CO_ENTIDADE", "codigo"]),
         estado: readDirectoryText(attrs, ["UF", "SG_UF", "estado"]),
         municipio: readDirectoryText(attrs, ["Município", "Municipio", "NO_MUNICIPIO", "municipio"]),
         rede: readDirectoryText(attrs, ["Dependência_Administrativa", "Dependencia_Administrativa", "TP_DEPENDENCIA", "rede"]),
-      };
-    })
-    .filter((item): item is SchoolDirectoryItem => Boolean(item));
+      }];
+    });
 }
 
 function uniqueSchoolDirectory(items: SchoolDirectoryItem[]) {
@@ -987,127 +1144,6 @@ function useSchoolDirectory(municipio: string, estado: string, fallback: SchoolD
   return { schools: uniqueSchoolDirectory([...officialSchools, ...localSchools]), loading };
 }
 
-function crc32(bytes: Uint8Array) {
-  let crc = -1;
-  for (const byte of bytes) {
-    crc = (crc >>> 8) ^ crcTable[(crc ^ byte) & 0xff];
-  }
-  return (crc ^ -1) >>> 0;
-}
-
-const crcTable = Array.from({ length: 256 }, (_, index) => {
-  let value = index;
-  for (let bit = 0; bit < 8; bit += 1) {
-    value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
-  }
-  return value >>> 0;
-});
-
-function zipDateTime(date = new Date()) {
-  const time = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
-  const day = date.getDate();
-  const month = date.getMonth() + 1;
-  const year = Math.max(1980, date.getFullYear()) - 1980;
-  return { time, date: (year << 9) | (month << 5) | day };
-}
-
-function writeUint16(target: Uint8Array, offset: number, value: number) {
-  target[offset] = value & 0xff;
-  target[offset + 1] = (value >>> 8) & 0xff;
-}
-
-function writeUint32(target: Uint8Array, offset: number, value: number) {
-  target[offset] = value & 0xff;
-  target[offset + 1] = (value >>> 8) & 0xff;
-  target[offset + 2] = (value >>> 16) & 0xff;
-  target[offset + 3] = (value >>> 24) & 0xff;
-}
-
-function concatBytes(parts: Uint8Array[]) {
-  const total = parts.reduce((sum, part) => sum + part.length, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const part of parts) {
-    out.set(part, offset);
-    offset += part.length;
-  }
-  return out;
-}
-
-function createZip(files: Array<{ path: string; content: string }>) {
-  const encoder = new TextEncoder();
-  const now = zipDateTime();
-  const localParts: Uint8Array[] = [];
-  const centralParts: Uint8Array[] = [];
-  let offset = 0;
-
-  for (const file of files) {
-    const name = encoder.encode(file.path);
-    const data = encoder.encode(file.content);
-    const crc = crc32(data);
-    const local = new Uint8Array(30 + name.length);
-    writeUint32(local, 0, 0x04034b50);
-    writeUint16(local, 4, 20);
-    writeUint16(local, 6, 0x0800);
-    writeUint16(local, 8, 0);
-    writeUint16(local, 10, now.time);
-    writeUint16(local, 12, now.date);
-    writeUint32(local, 14, crc);
-    writeUint32(local, 18, data.length);
-    writeUint32(local, 22, data.length);
-    writeUint16(local, 26, name.length);
-    local.set(name, 30);
-    localParts.push(local, data);
-
-    const central = new Uint8Array(46 + name.length);
-    writeUint32(central, 0, 0x02014b50);
-    writeUint16(central, 4, 20);
-    writeUint16(central, 6, 20);
-    writeUint16(central, 8, 0x0800);
-    writeUint16(central, 10, 0);
-    writeUint16(central, 12, now.time);
-    writeUint16(central, 14, now.date);
-    writeUint32(central, 16, crc);
-    writeUint32(central, 20, data.length);
-    writeUint32(central, 24, data.length);
-    writeUint16(central, 28, name.length);
-    writeUint32(central, 42, offset);
-    central.set(name, 46);
-    centralParts.push(central);
-    offset += local.length + data.length;
-  }
-
-  const centralDirectory = concatBytes(centralParts);
-  const end = new Uint8Array(22);
-  writeUint32(end, 0, 0x06054b50);
-  writeUint16(end, 8, files.length);
-  writeUint16(end, 10, files.length);
-  writeUint32(end, 12, centralDirectory.length);
-  writeUint32(end, 16, offset);
-  return concatBytes([...localParts, centralDirectory, end]);
-}
-
-async function writeTextFile(directory: DirectoryHandleLike, path: string[], content: string) {
-  let current = directory;
-  for (const segment of path.slice(0, -1)) {
-    current = await current.getDirectoryHandle(segment, { create: true });
-  }
-  const file = await current.getFileHandle(path[path.length - 1], { create: true });
-  const writable = await file.createWritable();
-  await writable.write(content);
-  await writable.close();
-}
-
-async function readJsonFile(directory: DirectoryHandleLike, fileName: string) {
-  try {
-    const handle = await directory.getFileHandle(fileName);
-    const file = await handle.getFile();
-    return JSON.parse(await file.text());
-  } catch {
-    return null;
-  }
-}
-
 function fileToDataUrl(file: File) {
   return new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
@@ -1115,6 +1151,135 @@ function fileToDataUrl(file: File) {
     reader.onerror = () => reject(reader.error);
     reader.readAsDataURL(file);
   });
+}
+
+function blobToDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function nextFrame() {
+  return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+
+function cssTextForPdfExport() {
+  const css = Array.from(document.styleSheets)
+    .flatMap((sheet) => {
+      try {
+        return Array.from(sheet.cssRules)
+          .filter((rule) => typeof CSSMediaRule === "undefined" || !(rule instanceof CSSMediaRule) || !rule.conditionText.includes("print"))
+          .map((rule) => rule.cssText);
+      } catch {
+        return [];
+      }
+    })
+    .join("\n");
+  return `${css}\n${pdfExportBaseCss()}`;
+}
+
+function pdfExportBaseCss() {
+  return `
+    body{margin:0;background:#fff;}
+    .paper,.document-page{width:794px!important;height:1123px!important;min-height:1123px!important;max-height:1123px!important;margin:0!important;box-shadow:none!important;overflow:hidden!important;transform:none!important;}
+    .document-page{box-sizing:border-box;}
+    .history-logo-image,.header-empty-box img,.signature-stamp{background:transparent!important;filter:none!important;image-rendering:auto!important;mix-blend-mode:normal!important;opacity:1!important;}
+    .watermark-image{display:block!important;background:transparent!important;height:auto!important;mix-blend-mode:normal!important;object-fit:contain!important;}
+    .vector-page .current-matrix .note-value{background:transparent!important;}
+    .vector-page .current-matrix .matrix-head,.vector-page .current-matrix .section-row td,.vector-page .current-matrix .result-final td,.vector-page .current-matrix .area-cell,.vector-page .current-matrix .vertical-cell,.vector-page .current-studies .study-head,.vector-page .workload-table .workload-year,.vector-page .workload-table .vertical-cell,.vector-page .current-studies .vertical-cell{background:var(--matrix-main-fill,#d9d9d9)!important;}
+    .vector-page .current-matrix .matrix-subhead{background:var(--matrix-sub-fill,transparent)!important;}
+    .vector-page .current-matrix td{border-color:var(--matrix-border-color,#000)!important;}
+  `;
+}
+
+async function inlineImagesForPdfExport(root: HTMLElement) {
+  const images = Array.from(root.querySelectorAll("img"));
+  await Promise.all(images.map(async (image) => {
+    const source = image.currentSrc || image.src || image.getAttribute("src") || "";
+    if (!source || source.startsWith("data:")) return;
+    try {
+      const response = await fetch(source, { cache: "force-cache" });
+      if (!response.ok) return;
+      image.setAttribute("src", await blobToDataUrl(await response.blob()));
+    } catch {
+      // Mantem a imagem original se o navegador nao permitir converter.
+    }
+  }));
+}
+
+async function waitForImages(root: HTMLElement) {
+  const images = Array.from(root.querySelectorAll("img"));
+  await Promise.all(images.map((image) => {
+    if (image.complete) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      image.onload = () => resolve();
+      image.onerror = () => resolve();
+    });
+  }));
+}
+
+function loadImage(source: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Nao foi possivel preparar a pagina."));
+    image.src = source;
+  });
+}
+
+function pdfExportSvg(markup: string, style: string, width: number, height: number, scale: number) {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${Math.round(width * scale)}" height="${Math.round(height * scale)}" viewBox="0 0 ${width} ${height}"><foreignObject width="${width}" height="${height}"><div xmlns="http://www.w3.org/1999/xhtml"><style><![CDATA[${style.replace(/]]>/g, "]]]]><![CDATA[>")}]]></style>${markup}</div></foreignObject></svg>`;
+}
+
+async function renderSvgToJpeg(svg: string, width: number, height: number, scale: number, mode: "blob" | "data") {
+  let url = "";
+  try {
+    url = mode === "blob"
+      ? URL.createObjectURL(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }))
+      : `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+    const image = await loadImage(url);
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(width * scale);
+    canvas.height = Math.round(height * scale);
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Nao foi possivel preparar o PDF.");
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
+    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    return { dataUrl: canvas.toDataURL("image/jpeg", 0.96), width: canvas.width, height: canvas.height };
+  } finally {
+    if (mode === "blob" && url) URL.revokeObjectURL(url);
+  }
+}
+
+async function documentPageToJpeg(page: HTMLElement, scale = 2.5) {
+  const width = Math.round(page.getBoundingClientRect().width || 794);
+  const height = Math.round(page.getBoundingClientRect().height || 1123);
+  const clone = page.cloneNode(true) as HTMLElement;
+  clone.classList.add("pdf-export-page");
+  await inlineImagesForPdfExport(clone);
+  await waitForImages(clone);
+  const markup = new XMLSerializer().serializeToString(clone);
+  const style = cssTextForPdfExport().replace(/<\/style/gi, "<\\/style");
+  const svg = pdfExportSvg(markup, style, width, height, scale);
+  try {
+    return await renderSvgToJpeg(svg, width, height, scale, "blob");
+  } catch {
+    try {
+      return await renderSvgToJpeg(svg, width, height, scale, "data");
+    } catch {
+      return renderSvgToJpeg(pdfExportSvg(markup, pdfExportBaseCss(), width, height, scale), width, height, scale, "data");
+    }
+  }
 }
 
 function transparentPngWithMaxSide(dataUrl: string, maxSide = 720) {
@@ -1156,19 +1321,46 @@ function transparentPngWithMaxSide(dataUrl: string, maxSide = 720) {
   });
 }
 
+function documentImageWithMaxSide(dataUrl: string, maxSide = 1600) {
+  return new Promise<string>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      const sourceWidth = image.naturalWidth || image.width || 1;
+      const sourceHeight = image.naturalHeight || image.height || 1;
+      const scale = Math.min(1, maxSide / Math.max(sourceWidth, sourceHeight));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(sourceWidth * scale));
+      canvas.height = Math.max(1, Math.round(sourceHeight * scale));
+      const context = canvas.getContext("2d");
+      if (!context) {
+        resolve(dataUrl);
+        return;
+      }
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = "high";
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL("image/png"));
+    };
+    image.onerror = () => reject(new Error("Imagem invalida"));
+    image.src = dataUrl;
+  });
+}
+
 async function removeLightBackground(dataUrl: string) {
   return transparentPngWithMaxSide(dataUrl);
 }
 
-async function imageFileToTransparentPng(file?: File) {
+async function imageFileToDocumentImage(file?: File) {
   if (!file) return "";
   if (!file.type.startsWith("image/")) {
     window.alert("Escolha um arquivo de imagem.");
     return "";
   }
-  let image = await transparentPngWithMaxSide(await fileToDataUrl(file), 640);
-  if (image.length > 850_000) image = await transparentPngWithMaxSide(image, 520);
-  if (image.length > 850_000) image = await transparentPngWithMaxSide(image, 420);
+  const original = await fileToDataUrl(file);
+  if (original.length <= 1_500_000) return original;
+  let image = await documentImageWithMaxSide(original, 1800);
+  if (image.length > 1_500_000) image = await documentImageWithMaxSide(image, 1500);
+  if (image.length > 1_500_000) image = await documentImageWithMaxSide(image, 1200);
   return image;
 }
 
@@ -1249,22 +1441,6 @@ function parseTsvWords(tsv: string | null | undefined, page: number): OcrWord[] 
   });
 }
 
-function wordsFromBlocks(blocks: import("tesseract.js").Block[] | null | undefined, page: number): OcrWord[] {
-  if (!blocks?.length) return [];
-  return blocks.flatMap((block) => block.paragraphs.flatMap((paragraph) => paragraph.lines.flatMap((line) => line.words.flatMap((word) => {
-    const text = plain(word.text);
-    if (!text || word.confidence < 15) return [];
-    return [{
-      text,
-      left: word.bbox.x0,
-      top: word.bbox.y0,
-      width: word.bbox.x1 - word.bbox.x0,
-      height: word.bbox.y1 - word.bbox.y0,
-      page,
-    }];
-  }))));
-}
-
 function recognizedScore(text: string, words: OcrWord[]) {
   const normalized = plain(text);
   const labels = [
@@ -1282,7 +1458,7 @@ function recognizedScore(text: string, words: OcrWord[]) {
     "RESULTADO",
   ];
   const labelScore = labels.filter((label) => normalized.includes(label)).length * 50;
-  const dateScore = (normalized.match(/\b\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}\b/g) ?? []).length * 30;
+  const dateScore = (normalized.match(/\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/g) ?? []).length * 30;
   const noteScore = (normalized.match(/\b(?:10(?:[,.]0{1,2})?|[0-9][,.][0-9]{1,2})\b/g) ?? []).length * 12;
   const workloadScore = (normalized.match(/\b[1-2]?\d{3}\b/g) ?? []).length * 6;
   return labelScore + dateScore + noteScore + workloadScore + words.length + normalized.length / 20;
@@ -1506,38 +1682,6 @@ function HistoryQrCode({ record }: { record: HistoryRecord }) {
   );
 }
 
-async function recordsFromComputerFolder(directory: DirectoryHandleLike, fallbackName: string) {
-  const bundle = await readJsonFile(directory, "dados-da-pasta.json");
-  if (bundle?.historicos?.length) {
-    return {
-      folderName: bundle.pasta?.nome || fallbackName,
-      records: bundle.historicos.map(normalizeHistory),
-    };
-  }
-
-  let source = directory;
-  try {
-    source = await directory.getDirectoryHandle("alunos");
-  } catch {
-    source = directory;
-  }
-
-  const records: HistoryRecord[] = [];
-  for await (const [, handle] of source.entries()) {
-    if (handle.kind !== "file" || !handle.name.toLocaleLowerCase("pt-BR").endsWith(".json")) continue;
-    try {
-      const file = await handle.getFile();
-      const parsed = JSON.parse(await file.text());
-      const record = parsed?.historico ?? parsed;
-      if (record?.aluno && record?.matriz) records.push(normalizeHistory(record));
-    } catch {
-      // Ignora arquivos que nao sejam historicos validos.
-    }
-  }
-
-  return { folderName: fallbackName, records };
-}
-
 function createBlankNotes(rows = matrixSeed) {
   return rows.reduce<Record<string, Record<number, string>>>((acc, component) => {
     acc[component.id] = {};
@@ -1654,7 +1798,7 @@ function createHistoryFromModel(school: School, schoolId = "", folder?: Folder |
 }
 
 function findFirstDate(text: string) {
-  const match = text.match(/\b(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})\b/);
+  const match = text.match(/\b(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\b/);
   if (!match) return "";
   const day = match[1].padStart(2, "0");
   const month = match[2].padStart(2, "0");
@@ -1664,7 +1808,7 @@ function findFirstDate(text: string) {
 
 function cleanOcrField(value: string) {
   return plain(value)
-    .replace(/^(?:NOME\s+(?:DO\s+)?ALUNO|NOME\s+DO\s+PAI|NOME\s+DA\s+MAE|NOME|ALUNO|DATA\s+DE\s+NASCIMENTO|NASCIMENTO|NASC|NACIONALIDADE|NATURALIDADE|IDENTIDADE|RG|PAI|MAE|FILIA[CÇ][AÃ]O|SEXO|CPF)\s*[:.\-]*/i, "")
+    .replace(/^(?:NOME\s+(?:DO\s+)?ALUNO|NOME\s+DO\s+PAI|NOME\s+DA\s+MAE|NOME|ALUNO|DATA\s+DE\s+NASCIMENTO|NASCIMENTO|NASC|NACIONALIDADE|NATURALIDADE|IDENTIDADE|RG|PAI|MAE|FILIA[CÇ][AÃ]O|SEXO|CPF)\s*[:.-]*/i, "")
     .replace(/\s+(?:NOME\s+(?:DO\s+)?ALUNO|NOME\s+DO\s+PAI|NOME\s+DA\s+MAE|DATA\s+DE\s+NASCIMENTO|NASCIMENTO|NASC|NACIONALIDADE|NATURALIDADE|IDENTIDADE|RG|CPF|SEXO|FILIA[CÇ][AÃ]O|PAI|MAE|PORTUGUES|MATEMATICA|HISTORIA|GEOGRAFIA|CIENCIAS|RESULTADO|CARGA|CARGA\s+HORARIA|FREQUENCIA)\b.*$/i, "")
     .replace(/\s+(?:DATA\s+DE\s+NASCIMENTO|NASCIMENTO|NASC|NACIONALIDADE|NATURALIDADE|IDENTIDADE|RG|CPF|SEXO|FILIA[CÇ][AÃ]O|NOME\s+DO\s+PAI|NOME\s+DA\s+MAE|PAI|MAE)\b.*$/i, "")
     .replace(/^[^A-Z0-9]+|[^A-Z0-9]+$/g, "")
@@ -1740,10 +1884,6 @@ function valuesFromLine(line: string, maxNumber = 100) {
       return Number.isNaN(numeric) || (numeric <= maxNumber && numeric >= 0);
     })
     .slice(0, 9);
-}
-
-function valuesAroundLine(lines: string[], startIndex: number, maxNumber = 100) {
-  return valuesFromLine(lines.slice(startIndex, startIndex + 4).join(" "), maxNumber);
 }
 
 function noteValuesFromText(text: string) {
@@ -2042,20 +2182,6 @@ function valueRightOfLabel(words: OcrWord[], labels: string[], stopLabels: strin
   return "";
 }
 
-function valuesFromWordRow(rowText: string, maxNumber = 100) {
-  return valuesFromLine(rowText, maxNumber)
-    .slice(0, 9);
-}
-
-function valuesAfterLabelInRow(row: ReturnType<typeof wordRows>[number], labels: string[], maxNumber = 100) {
-  const bounds = labelBoundsInRow(row.words, labels);
-  const text = row.words
-    .filter((word) => !bounds || word.left + word.width / 2 > bounds.end + 4)
-    .map((word) => word.text)
-    .join(" ");
-  return (maxNumber <= 100 ? noteValuesFromText(text) : workloadValuesFromText(text, maxNumber)).slice(0, 9);
-}
-
 function positionedValuesAfterLabel(row: OcrRow, labels: string[], maxNumber = 100): PositionedValue[] {
   const bounds = labelBoundsInRow(row.words, labels);
   return row.words
@@ -2175,7 +2301,7 @@ function fillTableFromWords(record: HistoryRecord, words: OcrWord[]) {
     const rowIndex = rows.findIndex((item) => rowMatchesComponent(item.text, component));
     const row = rowIndex >= 0 ? rows[rowIndex] : null;
     if (!row) continue;
-    const sameRowValues = positionedValuesAfterLabel(row, tokens);
+    const sameRowValues = positionedValuesAfterLabel(row, labelsForComponent(component));
     const nextRowValues = !sameRowValues.length && rows[rowIndex + 1]
       ? positionedValuesAfterLabel(rows[rowIndex + 1], [])
       : [];
@@ -2207,7 +2333,7 @@ function fillTableFromWords(record: HistoryRecord, words: OcrWord[]) {
         const year = nearestYearForValue(item, fallbackColumns, sourceRow.page);
         if (year) cargaHoraria[year] = { ...cargaHoraria[year], [key]: item.value };
       });
-      return;
+      continue;
     }
     sourceValues.forEach((item, index) => {
       cargaHoraria[index + 1] = { ...cargaHoraria[index + 1], [key]: item.value };
@@ -2410,7 +2536,7 @@ function applyOcrTextToHistory(record: HistoryRecord, rawText: string, words: Oc
     aluno: {
       ...record.aluno,
       nome: studentName || record.aluno.nome,
-      idAluno: studentId || record.aluno.idAluno,
+      idAluno: normalizeStudentCensusId(studentId || record.aluno.idAluno),
       nascimento: birthDate || record.aluno.nascimento,
       nacionalidade: nacionalidade || record.aluno.nacionalidade,
       naturalidadeCidade: naturalidadeCidade || record.aluno.naturalidadeCidade,
@@ -2469,13 +2595,18 @@ function compareText(a: string, b: string) {
 }
 
 function compareFolders(a: Folder, b: Folder) {
-  return compareText(a.nome, b.nome) || compareText(a.anoLetivo, b.anoLetivo);
+  return compareText(b.anoLetivo, a.anoLetivo) || compareText(a.nome, b.nome);
 }
 
 function compareStudentRecords(a: HistoryRecord, b: HistoryRecord) {
   return compareText(a.aluno.nome || a.codigo, b.aluno.nome || b.codigo)
     || compareText(a.anoLetivo, b.anoLetivo)
     || compareText(a.codigo, b.codigo);
+}
+
+function historyStepError(record: HistoryRecord, currentStep: number, targetStep: number, mode: "history" | "model" = "history") {
+  if (mode === "model" || targetStep <= currentStep || currentStep !== 0) return "";
+  return studentCensusIdError(record.aluno.idAluno);
 }
 
 function cloneMatrix(rows = matrixSeed) {
@@ -2735,7 +2866,7 @@ function normalizeHistory(record: HistoryRecord, fallbackSchoolId = migratedScho
     aluno: {
       ...studentDefaultsForSchool(defaultSchool),
       ...source.aluno,
-      idAluno: uppercaseInput(source.aluno?.idAluno || ""),
+      idAluno: normalizeStudentCensusId(source.aluno?.idAluno || ""),
       nacionalidade: uppercaseInput(source.aluno?.nacionalidade || "BRASILEIRA"),
       naturalidadeCidade: uppercaseInput(source.aluno?.naturalidadeCidade || defaultSchool.municipio),
       naturalidadeEstado: uppercaseInput(source.aluno?.naturalidadeEstado || defaultSchool.estado),
@@ -2963,6 +3094,8 @@ function App() {
   const [folderTeachingDraft, setFolderTeachingDraft] = useState("ENSINO FUNDAMENTAL");
   const [view, setView] = useState<"historicos" | "editor" | "escola" | "turmas" | "alunos" | "novo" | "transferencias" | "modelo">("historicos");
   const [yearFilter, setYearFilter] = useState("");
+  const [sidebarClassYearSearch, setSidebarClassYearSearch] = useState("");
+  const [sidebarClassNameSearch, setSidebarClassNameSearch] = useState("");
   const [step, setStep] = useState(0);
   const [query, setQuery] = useState("");
   const [zoom, setZoom] = useState(0.36);
@@ -2972,6 +3105,7 @@ function App() {
   const [saveNotice, setSaveNotice] = useState<SaveNotice | null>(null);
   const [duplicate, setDuplicate] = useState<HistoryRecord | null>(null);
   const [printBatch, setPrintBatch] = useState<HistoryRecord[] | null>(null);
+  const [pdfExportBatch, setPdfExportBatch] = useState<HistoryRecord[] | null>(null);
   const [isReady, setIsReady] = useState(false);
   const [activity, setActivity] = useState<{ activeUsers: CloudActiveUser[]; activities: CloudActivity[] }>({ activeUsers: [], activities: [] });
   const saveTimer = useRef<number | null>(null);
@@ -2980,6 +3114,7 @@ function App() {
   const dataRef = useRef(data);
   const skipNextAutosaveRef = useRef(false);
   const pendingWorkspaceSaveRef = useRef(false);
+  const pdfExportRef = useRef<HTMLElement | null>(null);
 
   const currentSchoolAccount = auth?.role === "school"
     ? data.escolas.find((school) => school.id === auth.schoolId)
@@ -3007,6 +3142,19 @@ function App() {
     : [];
   const active = schoolRecords.find((item) => item.id === activeId) ?? schoolRecords[0];
   const yearOptions = Array.from(new Set(schoolFolders.map((folder) => folder.anoLetivo).filter(Boolean))).sort().reverse();
+  const sidebarYearNeedle = upper(sidebarClassYearSearch.trim());
+  const sidebarNameNeedle = upper(sidebarClassNameSearch.trim());
+  const sidebarFolders = schoolFolders.filter((folder) => {
+    const matchesYear = !sidebarYearNeedle || upper(folder.anoLetivo).includes(sidebarYearNeedle);
+    const matchesName = !sidebarNameNeedle || upper(folder.nome).includes(sidebarNameNeedle);
+    return matchesYear && matchesName;
+  });
+  const sidebarFolderGroups = yearOptions
+    .map((year) => ({
+      year,
+      folders: sidebarFolders.filter((folder) => folder.anoLetivo === year),
+    }))
+    .filter((group) => group.folders.length);
   const schoolTransfers = currentSchoolAccount
     ? data.transferencias.filter((request) => (request.fromSchoolId === currentSchoolAccount.id || request.toSchoolId === currentSchoolAccount.id) && !request.hiddenForSchoolIds?.includes(currentSchoolAccount.id))
     : [];
@@ -3261,23 +3409,6 @@ function App() {
     );
   }).sort(compareStudentRecords);
 
-  const updateSchool = (patch: Partial<School>) => {
-    if (auth?.role !== "school" || !auth.schoolId) {
-      window.alert("Entre com o login da escola para alterar os dados cadastrais.");
-      return;
-    }
-    setData((current) => {
-      const nextData = {
-        ...current,
-        escolas: current.escolas.map((account) =>
-          account.id === auth.schoolId ? { ...account, escola: { ...account.escola, ...patch } } : account,
-        ),
-      };
-      dataRef.current = nextData;
-      return nextData;
-    });
-  };
-
   const saveSchoolSettings = async (school: School) => {
     if (auth?.role !== "school" || !auth.schoolId) {
       window.alert("Entre com o login da escola para alterar os dados cadastrais.");
@@ -3391,6 +3522,10 @@ function App() {
         window.alert("Usuario ou senha incorretos.");
         return;
       }
+    }
+    if (!adminCredentials) {
+      window.alert("Acesso restrito ainda não foi configurado.");
+      return;
     }
     if (usuario === adminCredentials.usuario && senha === adminCredentials.senha) {
       const session = { role: "owner" as const, nome: adminCredentials.nome || usuario };
@@ -4106,6 +4241,35 @@ function App() {
     }
   };
 
+  const deleteFolder = async (id: string) => {
+    if (!requireSchoolProfile()) return;
+    if (!currentSchoolAccount) return;
+    const folder = schoolFolders.find((item) => item.id === id);
+    if (!folder) return;
+    const totalRecords = schoolRecords.filter((record) => record.folderId === id).length;
+    if (totalRecords > 0) {
+      window.alert(`Essa turma tem ${totalRecords} histórico(s). Mova ou apague os históricos antes de excluir a turma.`);
+      return;
+    }
+    if (!window.confirm(`Apagar a turma ${folder.anoLetivo} - ${folder.nome}?`)) return;
+    const nextData = {
+      ...dataRef.current,
+      folders: dataRef.current.folders.filter((item) => item.id !== id),
+    };
+    dataRef.current = nextData;
+    skipNextAutosaveRef.current = true;
+    setData(nextData);
+    if (activeFolderId === id) {
+      setActiveFolderId("");
+      setYearFilter("");
+    }
+    setSaveState("Salvando...");
+    const saved = await persistData(nextData, "Turma apagada", { saveHistories: false });
+    if (saved) {
+      recordAction("TURMA", `Apagou a turma ${folder.nome} - ${folder.anoLetivo}.`, { targetId: folder.id, targetName: `${folder.nome} - ${folder.anoLetivo}` });
+    }
+  };
+
   const moveRecordToFolder = (id: string, folderId: string) => {
     if (!requireSchoolProfile()) return;
     const folder = data.folders.find((item) => item.id === folderId);
@@ -4242,132 +4406,53 @@ function App() {
     window.setTimeout(() => printWithTitle(upper(folder ? `${folder.anoLetivo} ${folder.nome}` : "TODOS OS HISTORICOS")), 120);
   };
 
-  const downloadFolderData = () => {
+  const downloadFolderPdfs = async () => {
     const folder = schoolFolders.find((item) => item.id === activeFolderId) ?? null;
-    const recordsToExport = recordsForActiveFolder();
-    const payload = {
-      exportedAt: new Date().toISOString(),
-      escola: currentSchool,
-      pasta: folder ? { id: folder.id, nome: `${folder.anoLetivo} - ${folder.nome}` } : { id: "", nome: "TODAS" },
-      historicos: recordsToExport,
-    };
-    const folderName = safeUpperFileName(folder ? `${folder.anoLetivo}-${folder.nome}` : "TODOS OS HISTORICOS");
-    const files = [
-      { path: `${folderName}/DADOS-DA-PASTA.json`, content: JSON.stringify(payload, null, 2) },
-      ...recordsToExport.map((record) => ({
-        path: `${folderName}/ALUNOS/${safeUpperFileName(record.aluno.nome || record.codigo)}.json`,
-        content: JSON.stringify(record, null, 2),
-      })),
-    ];
-    const blob = new Blob([createZip(files)], { type: "application/zip" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `${folderName}.zip`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
-    setSaveState("Pasta baixada");
-    showSaveNotice("Pasta baixada com sucesso");
-  };
-
-  const payloadForRecord = (record: HistoryRecord) => JSON.stringify({
-    exportedAt: new Date().toISOString(),
-    escola: currentSchool,
-    historico: record,
-  }, null, 2);
-
-  const saveFolderToComputer = async () => {
-    const folder = schoolFolders.find((item) => item.id === activeFolderId) ?? null;
-    const recordsToExport = recordsForActiveFolder();
-    if (!recordsToExport.length) return;
-    const folderName = safeUpperFileName(folder ? `${folder.anoLetivo}-${folder.nome}` : "TODOS OS HISTORICOS");
-    const payload = {
-      exportedAt: new Date().toISOString(),
-      escola: currentSchool,
-      pasta: folder ? { id: folder.id, nome: `${folder.anoLetivo} - ${folder.nome}` } : { id: "", nome: "TODAS" },
-      historicos: recordsToExport,
-    };
-    const picker = (window as DirectoryPickerWindow).showDirectoryPicker;
+    const recordsToPrint = recordsForActiveFolder();
+    if (!recordsToPrint.length) return;
+    const folderName = safeUpperFileName(folder ? `${folder.anoLetivo} ${folder.nome}` : "TODOS OS HISTORICOS");
+    setSaveState("Gerando pasta...");
+    showSaveNotice("Gerando pasta em PDF. Aguarde concluir.");
+    setPdfExportBatch(recordsToPrint);
 
     try {
-      if (!picker) {
-        downloadFolderData();
-        return;
+      await nextFrame();
+      await delay(700);
+      const container = pdfExportRef.current;
+      if (!container) throw new Error("Nao foi possivel preparar a pasta.");
+      await waitForImages(container);
+      const pages = Array.from(container.querySelectorAll<HTMLElement>(".document-page"));
+      const usedNames = new Map<string, number>();
+      const files: Array<{ path: string; content: Uint8Array }> = [];
+
+      for (let index = 0; index < recordsToPrint.length; index += 1) {
+        const record = recordsToPrint[index];
+        const pageOne = pages[index * 2];
+        const pageTwo = pages[index * 2 + 1];
+        if (!pageOne || !pageTwo) continue;
+        setSaveState(`Gerando PDF ${index + 1}/${recordsToPrint.length}`);
+        const pdfPages = [
+          await documentPageToJpeg(pageOne),
+          await documentPageToJpeg(pageTwo),
+        ];
+        const baseName = safeUpperFileName(record.aluno.nome || record.codigo || `HISTORICO-${index + 1}`);
+        const count = (usedNames.get(baseName) ?? 0) + 1;
+        usedNames.set(baseName, count);
+        const fileName = count > 1 ? `${baseName}-${count}.pdf` : `${baseName}.pdf`;
+        files.push({ path: `${folderName}/${fileName}`, content: createPdfFromJpegs(pdfPages) });
+        await delay(20);
       }
-      const directory = await picker.call(window, { mode: "readwrite" });
-      await writeTextFile(directory, [folderName, "DADOS-DA-PASTA.json"], JSON.stringify(payload, null, 2));
-      for (const record of recordsToExport) {
-        await writeTextFile(
-          directory,
-          [folderName, "ALUNOS", `${safeUpperFileName(record.aluno.nome || record.codigo)}.json`],
-          payloadForRecord(record),
-        );
-      }
-      setSaveState(`Pasta salva: ${folderName}`);
-      showSaveNotice("Pasta salva com sucesso");
-    } catch {
+
+      if (!files.length) throw new Error("Nao foi possivel gerar os PDFs.");
+      downloadBytes(createZip(files), `${folderName}.zip`, "application/zip");
+      setSaveState("Pasta baixada");
+      showSaveNotice("Pasta baixada com PDFs individuais");
+    } catch (error) {
+      console.error("Nao foi possivel baixar a pasta em PDF.", error);
       setSaveState("Salvo");
-    }
-  };
-
-  const importFolderFromComputer = async () => {
-    const picker = (window as DirectoryPickerWindow).showDirectoryPicker;
-    if (!picker) {
-      window.alert("Este navegador nao permite escolher uma pasta. Use a opcao de baixar.");
-      return;
-    }
-
-    try {
-      const directory = await picker.call(window, { mode: "read" });
-      const imports: Array<{ folderName: string; records: HistoryRecord[] }> = [];
-      const root = await recordsFromComputerFolder(directory, directory.name || "PASTA DO PC");
-      if (root.records.length) {
-        imports.push(root);
-      } else {
-        for await (const [, handle] of directory.entries()) {
-          if (handle.kind !== "directory") continue;
-          const current = await recordsFromComputerFolder(handle, handle.name);
-          if (current.records.length) imports.push(current);
-        }
-      }
-
-      if (!imports.length) {
-        window.alert("Nao encontrei historicos nessa pasta.");
-        return;
-      }
-
-      const current = dataRef.current;
-      const folders = [...current.folders];
-      const byId = new Map(current.historicos.map((record) => [record.id, record]));
-      for (const imported of imports) {
-        const folderName = upper(imported.folderName);
-        let folder = folders.find((item) => item.schoolId === auth?.schoolId && upper(item.nome) === folderName);
-        if (!folder) {
-          folder = {
-            id: crypto.randomUUID(),
-            schoolId: auth?.schoolId || "",
-            anoLetivo: String(new Date().getFullYear()),
-            nome: imported.folderName,
-            tipoEnsino: "ENSINO FUNDAMENTAL",
-          };
-          folders.push(folder);
-          pendingWorkspaceSaveRef.current = true;
-        }
-        for (const record of imported.records) {
-          const nextRecord = { ...record, schoolId: auth?.schoolId || "", folderId: folder.id, anoLetivo: folder.anoLetivo, updatedAt: new Date().toISOString() };
-          byId.set(record.id, nextRecord);
-        }
-      }
-      const nextData = { ...current, folders, historicos: Array.from(byId.values()) };
-      dataRef.current = nextData;
-      setData(nextData);
-      setView("historicos");
-      setSaveState("Pasta importada");
-      showSaveNotice("Pasta importada com sucesso");
-    } catch {
-      setSaveState("Salvo");
+      showSaveNotice("Não foi possível baixar a pasta em PDF", "error");
+    } finally {
+      setPdfExportBatch(null);
     }
   };
 
@@ -4481,14 +4566,32 @@ function App() {
             <div className="sidebar-rule" />
             <div className="folder-panel">
               <strong>Pastas / Turmas</strong>
+              <div className="folder-search">
+                <label>
+                  <span>Ano</span>
+                  <input value={sidebarClassYearSearch} onChange={(event) => setSidebarClassYearSearch(uppercaseInput(event.target.value))} placeholder="2026" />
+                </label>
+                <label>
+                  <span>Turma</span>
+                  <input value={sidebarClassNameSearch} onChange={(event) => setSidebarClassNameSearch(uppercaseInput(event.target.value))} placeholder="6 ANO A" />
+                </label>
+              </div>
               <button className={!activeFolderId ? "folder-link active" : "folder-link"} onClick={() => { setActiveFolderId(""); setView("historicos"); }}>
                 Todas
               </button>
-              {schoolFolders.map((folder) => (
-                <button key={folder.id} className={activeFolderId === folder.id ? "folder-link active" : "folder-link"} onClick={() => { setActiveFolderId(folder.id); setView("historicos"); }}>
-                  {folder.anoLetivo} - {folder.nome}
-                </button>
-              ))}
+              <div className="folder-groups">
+                {sidebarFolderGroups.map((group) => (
+                  <section className="folder-year-group" key={group.year}>
+                    <span>{group.year}</span>
+                    {group.folders.map((folder) => (
+                      <button key={folder.id} className={activeFolderId === folder.id ? "folder-link active" : "folder-link"} onClick={() => { setActiveFolderId(folder.id); setView("historicos"); }}>
+                        {folder.nome}
+                      </button>
+                    ))}
+                  </section>
+                ))}
+                {Boolean(schoolFolders.length) && !sidebarFolderGroups.length && <em className="folder-empty">Nenhuma turma encontrada</em>}
+              </div>
             </div>
           </>
         )}
@@ -4581,10 +4684,8 @@ function App() {
             printRecord={printRecord}
             savePdfForRecord={savePdfForRecord}
             deleteRecord={deleteRecord}
-            downloadFolderData={downloadFolderData}
-            saveFolderToComputer={saveFolderToComputer}
-            importFolderFromComputer={importFolderFromComputer}
             printFolderUnified={printFolderUnified}
+            downloadFolderPdfs={downloadFolderPdfs}
           />
         )}
 
@@ -4607,6 +4708,7 @@ function App() {
         {schoolProfileReady && view === "turmas" && (
           <ClassroomScreen
             folders={schoolFolders}
+            records={schoolRecords}
             folderDraft={folderDraft}
             folderYearDraft={folderYearDraft}
             folderTeachingDraft={folderTeachingDraft}
@@ -4614,6 +4716,7 @@ function App() {
             setFolderYearDraft={setFolderYearDraft}
             setFolderTeachingDraft={setFolderTeachingDraft}
             createFolder={createFolder}
+            deleteFolder={deleteFolder}
             selectFolder={(id) => {
               const folder = schoolFolders.find((item) => item.id === id);
               setActiveFolderId(id);
@@ -4666,7 +4769,17 @@ function App() {
         {schoolProfileReady && view === "editor" && active && (
           <div className={previewCollapsed ? "editor-grid preview-collapsed" : "editor-grid"}>
             <section className="form-pane">
-              <Progress step={step} setStep={setStep} />
+              <Progress
+                step={step}
+                setStep={(targetStep) => {
+                  const error = historyStepError(active, step, targetStep);
+                  if (error) {
+                    window.alert(error);
+                    return;
+                  }
+                  setStep(targetStep);
+                }}
+              />
               {duplicate && (
                 <div className="duplicate-alert">
                   <strong>Possivel historico ja cadastrado</strong>
@@ -4683,7 +4796,14 @@ function App() {
                 step={step}
                 updateActive={updateActive}
                 schoolDirectory={schoolDirectory}
-                setStep={setStep}
+                setStep={(targetStep) => {
+                  const error = historyStepError(active, step, targetStep);
+                  if (error) {
+                    window.alert(error);
+                    return;
+                  }
+                  setStep(targetStep);
+                }}
                 finishHistory={finishHistory}
               />
             </section>
@@ -4727,6 +4847,16 @@ function App() {
             ))}
           </section>
         )}
+        {pdfExportBatch?.length ? (
+          <section className="pdf-export-only" ref={pdfExportRef} aria-hidden="true">
+            {pdfExportBatch.map((record) => (
+              <Fragment key={`pdf-export-${record.id}`}>
+                <DocumentPageOne record={record} school={currentSchool} />
+                <DocumentPageTwo record={record} school={currentSchool} />
+              </Fragment>
+            ))}
+          </section>
+        ) : null}
       </section>
     </main>
   );
@@ -5441,7 +5571,7 @@ function OwnerDashboard({
             <h2>Cadastrar escola</h2>
           </div>
           <div className="settings-grid">
-            <label className="wide">
+            <div className="wide">
               <span>Nome da escola</span>
               <SchoolNameInput
                 value={draft.escola.nome}
@@ -5450,7 +5580,7 @@ function OwnerDashboard({
                 estado={draft.escola.estado}
                 schoolDirectory={schoolDirectory}
               />
-            </label>
+            </div>
             <label>
               <span>Codigo INEP</span>
               <input value={draft.escola.codigo} onChange={(event) => updateDraftSchool({ codigo: uppercaseInput(event.target.value) })} />
@@ -5537,11 +5667,11 @@ function OwnerDashboard({
                   <td>
                     <input
                       value={account.escola.nome}
-                      onChange={(event) => onUpdateSchool(account.id, { escola: { nome: uppercaseInput(event.target.value) } })}
+                      onChange={(event) => onUpdateSchool(account.id, { escola: { ...account.escola, nome: uppercaseInput(event.target.value) } })}
                     />
                   </td>
                   <td>
-                    <input value={account.escola.codigo} onChange={(event) => onUpdateSchool(account.id, { escola: { codigo: uppercaseInput(event.target.value) } })} />
+                    <input value={account.escola.codigo} onChange={(event) => onUpdateSchool(account.id, { escola: { ...account.escola, codigo: uppercaseInput(event.target.value) } })} />
                   </td>
                   <td>
                     <select value={account.tipo} onChange={(event) => onUpdateSchool(account.id, { tipo: event.target.value as SchoolKind })}>
@@ -5879,6 +6009,7 @@ function HistoryModelEditor({
 
 function ClassroomScreen({
   folders,
+  records,
   folderDraft,
   folderYearDraft,
   folderTeachingDraft,
@@ -5886,9 +6017,11 @@ function ClassroomScreen({
   setFolderYearDraft,
   setFolderTeachingDraft,
   createFolder,
+  deleteFolder,
   selectFolder,
 }: {
   folders: Folder[];
+  records: HistoryRecord[];
   folderDraft: string;
   folderYearDraft: string;
   folderTeachingDraft: string;
@@ -5896,8 +6029,19 @@ function ClassroomScreen({
   setFolderYearDraft: (value: string) => void;
   setFolderTeachingDraft: (value: string) => void;
   createFolder: (afterCreate?: "stay" | "open") => void;
+  deleteFolder: (id: string) => void;
   selectFolder: (id: string) => void;
 }) {
+  const [classYearSearch, setClassYearSearch] = useState("");
+  const [classNameSearch, setClassNameSearch] = useState("");
+  const filteredFolders = folders.filter((folder) => {
+    const yearNeedle = upper(classYearSearch.trim());
+    const nameNeedle = upper(classNameSearch.trim());
+    const matchesYear = !yearNeedle || upper(folder.anoLetivo).includes(yearNeedle);
+    const matchesName = !nameNeedle || upper(folder.nome).includes(nameNeedle);
+    return matchesYear && matchesName;
+  });
+
   return (
     <section className="settings-screen">
       <div className="panel-heading">
@@ -5930,15 +6074,47 @@ function ClassroomScreen({
         <button className="secondary" onClick={() => createFolder("open")}>Criar e abrir turma</button>
       </div>
 
+      <section className="class-search">
+        <div className="panel-heading compact-heading">
+          <h2>Buscar turma</h2>
+          <p>{filteredFolders.length} de {folders.length} turma(s)</p>
+        </div>
+        <div className="class-search-grid">
+          <label>
+            <span>Ano letivo</span>
+            <input value={classYearSearch} onChange={(event) => setClassYearSearch(uppercaseInput(event.target.value))} placeholder="2026" />
+          </label>
+          <label>
+            <span>Nome da turma</span>
+            <input value={classNameSearch} onChange={(event) => setClassNameSearch(uppercaseInput(event.target.value))} placeholder="6 ANO A" />
+          </label>
+          {(classYearSearch || classNameSearch) && (
+            <button type="button" onClick={() => { setClassYearSearch(""); setClassNameSearch(""); }}>
+              Limpar busca
+            </button>
+          )}
+        </div>
+      </section>
+
       <div className="class-cards">
-        {folders.map((folder) => (
-          <button key={folder.id} className="class-card" onClick={() => selectFolder(folder.id)}>
-            <strong>{folder.nome}</strong>
-            <span>{folder.anoLetivo}</span>
-            <small>{folder.tipoEnsino}</small>
-          </button>
-        ))}
+        {filteredFolders.map((folder) => {
+          const totalRecords = records.filter((record) => record.folderId === folder.id).length;
+          return (
+            <article key={folder.id} className="class-card">
+              <button type="button" className="class-card-open" onClick={() => selectFolder(folder.id)}>
+                <strong>{folder.nome}</strong>
+                <span>{folder.anoLetivo}</span>
+                <small>{folder.tipoEnsino}</small>
+                <em>{totalRecords} histórico(s)</em>
+              </button>
+              <button type="button" className="class-delete" onClick={() => deleteFolder(folder.id)}>
+                Apagar turma
+              </button>
+            </article>
+          );
+        })}
         {!folders.length && <p className="empty-state">Nenhuma turma criada ainda.</p>}
+        {Boolean(folders.length) && !filteredFolders.length && <p className="empty-state">Nenhuma turma encontrada nessa busca.</p>}
       </div>
     </section>
   );
@@ -5959,9 +6135,9 @@ function StudentsArchive({
   const [year, setYear] = useState("");
   const [folderId, setFolderId] = useState("");
   const [status, setStatus] = useState("todos");
+  const [pageIndex, setPageIndex] = useState(0);
   const yearsList = Array.from(new Set(records.map((record) => transferYearFor(record)).filter(Boolean))).sort().reverse();
   const filteredRecords = records.filter((record) => {
-    const folder = folders.find((item) => item.id === record.folderId);
     const transferYear = transferYearFor(record);
     const matchesQuery = !query || record.aluno.nome.toLocaleLowerCase("pt-BR").includes(query.toLocaleLowerCase("pt-BR"));
     const matchesYear = !year || transferYear === year || record.anoLetivo === year;
@@ -5969,6 +6145,29 @@ function StudentsArchive({
     const matchesStatus = status === "todos" || record.status === "Emitido";
     return matchesQuery && matchesYear && matchesFolder && matchesStatus;
   }).sort(compareStudentRecords);
+  const totalPages = Math.max(1, Math.ceil(filteredRecords.length / recordsPageSize));
+  const currentPage = Math.min(pageIndex, totalPages - 1);
+  const visibleRecords = filteredRecords.slice(currentPage * recordsPageSize, currentPage * recordsPageSize + recordsPageSize);
+
+  useEffect(() => {
+    setPageIndex(0);
+  }, [query, year, folderId, status]);
+
+  useEffect(() => {
+    if (pageIndex > totalPages - 1) setPageIndex(totalPages - 1);
+  }, [pageIndex, totalPages]);
+
+  const pager = (
+    <div className="list-pager">
+      <span>
+        {filteredRecords.length
+          ? `${currentPage * recordsPageSize + 1}-${Math.min((currentPage + 1) * recordsPageSize, filteredRecords.length)} de ${filteredRecords.length}`
+          : "0 alunos"}
+      </span>
+      <button type="button" disabled={currentPage <= 0} onClick={() => setPageIndex((page) => Math.max(0, page - 1))}>Anterior</button>
+      <button type="button" disabled={currentPage >= totalPages - 1} onClick={() => setPageIndex((page) => Math.min(totalPages - 1, page + 1))}>Próximo</button>
+    </div>
+  );
 
   return (
     <section className="list-screen">
@@ -6003,6 +6202,7 @@ function StudentsArchive({
           </select>
         </label>
       </div>
+      {pager}
       <table className="records-table">
         <thead>
           <tr>
@@ -6014,7 +6214,7 @@ function StudentsArchive({
           </tr>
         </thead>
         <tbody>
-          {filteredRecords.map((record) => (
+          {visibleRecords.map((record) => (
             <tr key={record.id}>
               <td><strong>{upper(record.aluno.nome) || "SEM NOME"}</strong><small>{formatDate(record.aluno.nascimento)}</small></td>
               <td>{folderTitle(folders.find((folder) => folder.id === record.folderId))}</td>
@@ -6030,6 +6230,7 @@ function StudentsArchive({
           )}
         </tbody>
       </table>
+      {filteredRecords.length > recordsPageSize && pager}
     </section>
   );
 }
@@ -6064,12 +6265,14 @@ function PhotoHistoryImport({
   const [rawText, setRawText] = useState("");
   const [ocrWords, setOcrWords] = useState<OcrWord[]>([]);
   const [draft, setDraft] = useState<HistoryRecord | null>(null);
+  const [draftStudentIdTouched, setDraftStudentIdTouched] = useState(false);
   const [cameraOpen, setCameraOpen] = useState(false);
   const [cameraState, setCameraState] = useState("");
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const selectedFolder = folders.find((folder) => folder.id === activeFolderId) ?? null;
   const createBlankDraft = () => createHistoryFromModel(school, schoolId, selectedFolder, model);
+  const draftStudentIdError = draft && draftStudentIdTouched ? studentCensusIdError(draft.aluno.idAluno) : "";
 
   const stopCamera = () => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -6319,7 +6522,14 @@ function PhotoHistoryImport({
           </div>
           <div className="form-grid">
             <Field label="Nome completo" value={draft.aluno.nome} onChange={(value) => updateDraftStudent({ nome: value })} wide />
-            <Field label="ID do aluno" value={draft.aluno.idAluno} onChange={(value) => updateDraftStudent({ idAluno: value })} />
+            <Field
+              label="ID do aluno"
+              value={draft.aluno.idAluno}
+              onChange={(value) => updateDraftStudent({ idAluno: normalizeStudentCensusId(value) })}
+              inputMode="numeric"
+              onBlur={() => setDraftStudentIdTouched(true)}
+              error={draftStudentIdError}
+            />
             <Field label="Data de nascimento" type="date" value={draft.aluno.nascimento} onChange={(value) => updateDraftStudent({ nascimento: value })} />
             <Field label="Nacionalidade" value={draft.aluno.nacionalidade} onChange={(value) => updateDraftStudent({ nacionalidade: value })} />
             <LocationFields
@@ -6410,7 +6620,17 @@ function PhotoHistoryImport({
             </table>
           </div>
           <div className="inline-actions">
-            <button className="primary" onClick={() => createFromPhotos({ frente: front, verso: back, texto: rawText, palavras: ocrWords, record: draft })}>
+            <button
+              className="primary"
+              onClick={() => {
+                const error = studentCensusIdError(draft.aluno.idAluno);
+                if (error) {
+                  window.alert(error);
+                  return;
+                }
+                createFromPhotos({ frente: front, verso: back, texto: rawText, palavras: ocrWords, record: draft });
+              }}
+            >
               Aplicar no nosso modelo
             </button>
           </div>
@@ -6437,10 +6657,8 @@ function HistoryList({
   printRecord,
   savePdfForRecord,
   deleteRecord,
-  downloadFolderData,
-  saveFolderToComputer,
-  importFolderFromComputer,
   printFolderUnified,
+  downloadFolderPdfs,
 }: {
   query: string;
   setQuery: (value: string) => void;
@@ -6458,11 +6676,34 @@ function HistoryList({
   printRecord: (id: string) => void;
   savePdfForRecord: (id: string) => void;
   deleteRecord: (id: string) => void;
-  downloadFolderData: () => void;
-  saveFolderToComputer: () => void;
-  importFolderFromComputer: () => void;
   printFolderUnified: () => void;
+  downloadFolderPdfs: () => void;
 }) {
+  const [pageIndex, setPageIndex] = useState(0);
+  const totalPages = Math.max(1, Math.ceil(records.length / recordsPageSize));
+  const currentPage = Math.min(pageIndex, totalPages - 1);
+  const visibleRecords = records.slice(currentPage * recordsPageSize, currentPage * recordsPageSize + recordsPageSize);
+
+  useEffect(() => {
+    setPageIndex(0);
+  }, [query, activeFolderId, yearFilter]);
+
+  useEffect(() => {
+    if (pageIndex > totalPages - 1) setPageIndex(totalPages - 1);
+  }, [pageIndex, totalPages]);
+
+  const pager = (
+    <div className="list-pager">
+      <span>
+        {records.length
+          ? `${currentPage * recordsPageSize + 1}-${Math.min((currentPage + 1) * recordsPageSize, records.length)} de ${records.length}`
+          : "0 históricos"}
+      </span>
+      <button type="button" disabled={currentPage <= 0} onClick={() => setPageIndex((page) => Math.max(0, page - 1))}>Anterior</button>
+      <button type="button" disabled={currentPage >= totalPages - 1} onClick={() => setPageIndex((page) => Math.min(totalPages - 1, page + 1))}>Próximo</button>
+    </div>
+  );
+
   return (
     <section className="list-screen">
       <div className="list-toolbar">
@@ -6487,19 +6728,14 @@ function HistoryList({
           </select>
         </label>
         <button disabled={!records.length} onClick={printFolderUnified}>
-          PDF unico da pasta
+          PDF único
         </button>
-        <button disabled={!records.length} onClick={downloadFolderData}>
-          {activeFolderName ? "Baixar pasta" : "Baixar tudo"}
-        </button>
-        <button disabled={!records.length} onClick={saveFolderToComputer}>
-          Salvar pasta no PC
-        </button>
-        <button onClick={importFolderFromComputer}>
-          Abrir pasta do PC
+        <button disabled={!records.length} onClick={() => void downloadFolderPdfs()}>
+          Baixar pasta
         </button>
         <button className="primary" onClick={() => createNew()}>+ Novo Historico</button>
       </div>
+      {pager}
       <table className="records-table">
         <thead>
           <tr>
@@ -6513,7 +6749,7 @@ function HistoryList({
           </tr>
         </thead>
         <tbody>
-          {records.map((record) => (
+          {visibleRecords.map((record) => (
             (() => {
               const folder = folders.find((item) => item.id === record.folderId);
               return (
@@ -6547,6 +6783,7 @@ function HistoryList({
           )}
         </tbody>
       </table>
+      {records.length > recordsPageSize && pager}
     </section>
   );
 }
@@ -6741,7 +6978,7 @@ function SchoolSettings({ school, schoolDirectory, onSave }: { school: School; s
     setDraft((current) => ({ ...current, ...patch }));
   };
   const uploadSchoolImage = async (key: SchoolImageKey, file?: File) => {
-    const image = await imageFileToTransparentPng(file);
+    const image = await imageFileToDocumentImage(file);
     if (!image) return;
     updateDraft({ [key]: image });
   };
@@ -6796,7 +7033,7 @@ function SchoolSettings({ school, schoolDirectory, onSave }: { school: School; s
           <div className="media-panel-heading">
             <div>
               <h3>Imagens da escola</h3>
-              <p>Logo, marca d'água e carimbos usados nos históricos.</p>
+              <p>Logo, marca d&apos;água e carimbos usados nos históricos.</p>
             </div>
             <span>{mediaItems.filter((item) => draft[item.key]).length}/{mediaItems.length}</span>
           </div>
@@ -6870,18 +7107,36 @@ function StepForm({
   finishHistory: (id: string, generatePdf?: boolean) => Promise<void>;
   mode?: "history" | "model";
 }) {
+  const [studentIdTouched, setStudentIdTouched] = useState(false);
+  const stepScrollRef = useRef<HTMLDivElement | null>(null);
   const updateStudent = (patch: Partial<Student>) => updateActive((item) => ({ ...item, aluno: { ...item.aluno, ...patch } }));
   const updateLegal = (patch: Partial<SchoolLegal>) => updateActive((item) => ({ ...item, dadosLegais: { ...item.dadosLegais, ...patch } }));
+  const studentIdError = mode === "history" && studentIdTouched ? studentCensusIdError(record.aluno.idAluno) : "";
+
+  useEffect(() => {
+    setStudentIdTouched(false);
+  }, [record.id]);
+
+  useEffect(() => {
+    stepScrollRef.current?.scrollTo({ top: 0, left: 0 });
+  }, [step, record.id]);
 
   return (
     <section className="step-card">
-      <div className="step-scroll">
+      <div className="step-scroll" ref={stepScrollRef}>
         {step === 0 && (
           <>
             <h2>Identificacao do Aluno</h2>
             <div className="form-grid">
               <Field label="Nome completo" value={record.aluno.nome} onChange={(value) => updateStudent({ nome: value })} wide />
-              <Field label="ID do aluno" value={record.aluno.idAluno} onChange={(value) => updateStudent({ idAluno: value })} />
+              <Field
+                label="ID do aluno"
+                value={record.aluno.idAluno}
+                onChange={(value) => updateStudent({ idAluno: normalizeStudentCensusId(value) })}
+                inputMode="numeric"
+                onBlur={() => setStudentIdTouched(true)}
+                error={studentIdError}
+              />
               <Field label="Data de nascimento" type="date" value={record.aluno.nascimento} onChange={(value) => updateStudent({ nascimento: value })} />
               <Field label="Nacionalidade" value={record.aluno.nacionalidade} onChange={(value) => updateStudent({ nacionalidade: value })} />
               <LocationFields
@@ -6940,11 +7195,40 @@ function StepForm({
   );
 }
 
-function Field({ label, value, onChange, type = "text", wide = false, disabled = false }: { label: string; value: string; onChange: (value: string) => void; type?: string; wide?: boolean; disabled?: boolean }) {
+function Field({
+  label,
+  value,
+  onChange,
+  type = "text",
+  wide = false,
+  disabled = false,
+  inputMode,
+  onBlur,
+  error = "",
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  type?: string;
+  wide?: boolean;
+  disabled?: boolean;
+  inputMode?: InputHTMLAttributes<HTMLInputElement>["inputMode"];
+  onBlur?: () => void;
+  error?: string;
+}) {
   return (
-    <label className={wide ? "wide" : ""}>
+    <label className={`${wide ? "wide" : ""}${error ? " has-error" : ""}`.trim()}>
       <span>{label}</span>
-      <input disabled={disabled} type={type} value={value} onChange={(event) => onChange(type === "text" ? uppercaseInput(event.target.value) : event.target.value)} />
+      <input
+        aria-invalid={Boolean(error)}
+        disabled={disabled}
+        inputMode={inputMode}
+        onBlur={onBlur}
+        type={type}
+        value={value}
+        onChange={(event) => onChange(type === "text" ? uppercaseInput(event.target.value) : event.target.value)}
+      />
+      {error && <small className="field-error">{error}</small>}
     </label>
   );
 }
@@ -7496,6 +7780,8 @@ function Conference({
     if (mode === "model") return [];
     const list: Array<{ label: string; step: number }> = [];
     if (!record.aluno.nome) list.push({ label: "Nome do aluno nao informado", step: 0 });
+    const idError = studentCensusIdError(record.aluno.idAluno);
+    if (idError) list.push({ label: idError, step: 0 });
     if (!record.aluno.nascimento) list.push({ label: "Data de nascimento nao informada", step: 0 });
     if (!record.aluno.paiNaoDeclarado && !record.aluno.pai && !record.aluno.mae) list.push({ label: "Filiacao nao preenchida", step: 0 });
     if (!record.dadosLegais.parecer) list.push({ label: "Parecer nao informado", step: 1 });
@@ -7530,7 +7816,22 @@ function Conference({
           ))
         )}
       </div>
-      <div className="inline-actions"><button className="primary" onClick={() => void finishHistory(record.id)}>{mode === "model" ? "Salvar modelo" : "Salvar histórico"}</button></div>
+      <div className="inline-actions">
+        <button
+          className="primary"
+          onClick={() => {
+            const error = mode === "history" ? studentCensusIdError(record.aluno.idAluno) : "";
+            if (error) {
+              window.alert(error);
+              setStep(0);
+              return;
+            }
+            void finishHistory(record.id);
+          }}
+        >
+          {mode === "model" ? "Salvar modelo" : "Salvar histórico"}
+        </button>
+      </div>
     </>
   );
 }
@@ -7608,7 +7909,7 @@ function DocumentHeader({ school, useSchoolStamp }: { school: School; useSchoolS
   return (
     <div className="current-doc-header">
       <div className="header-logo-box">
-        <img src={historyLogo} alt="" />
+        <img className="history-logo-image" src={historyLogo} alt="" />
       </div>
       <div className="school-title-box">
         <h2>ESTADO DO CEARÁ</h2>

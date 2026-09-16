@@ -363,15 +363,22 @@ label span {
 }
 
 .app-shell {
-  display: grid;
-  grid-template-columns: 286px minmax(0, 1fr);
+  display: block;
   min-height: 100vh;
 }
 
 .sidebar {
+  position: fixed;
+  inset: 0 auto 0 0;
+  z-index: 20;
   display: flex;
   flex-direction: column;
   gap: 10px;
+  width: 286px;
+  height: 100dvh;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
   background:
     radial-gradient(circle at 20% 8%, rgba(28, 189, 169, 0.22), transparent 24%),
     linear-gradient(180deg, #102a3d 0%, #091827 100%);
@@ -382,6 +389,7 @@ label span {
 
 .brand {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 12px;
   margin-bottom: 18px;
@@ -460,8 +468,12 @@ label span {
 }
 
 .folder-panel {
-  display: grid;
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
   gap: 8px;
+  min-height: auto;
+  overflow: visible;
 }
 
 .folder-panel strong {
@@ -484,6 +496,72 @@ label span {
   background: #233044;
   border-color: #314158;
   color: #ffffff;
+}
+
+.folder-search {
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr);
+  gap: 7px;
+}
+
+.folder-search label {
+  display: grid;
+  gap: 4px;
+}
+
+.folder-search span {
+  margin: 0;
+  color: #b8c0cc;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.folder-search input {
+  min-height: 32px;
+  border-color: #344054;
+  background: #0f172a;
+  color: #ffffff;
+  padding: 7px 8px;
+  font-size: 12px;
+}
+
+.folder-search input::placeholder {
+  color: #667085;
+}
+
+.folder-groups {
+  display: grid;
+  flex: 0 1 auto;
+  min-height: auto;
+  max-height: none;
+  overflow: visible;
+  gap: 9px;
+  padding-right: 3px;
+}
+
+.folder-year-group {
+  display: grid;
+  gap: 5px;
+}
+
+.folder-year-group > span {
+  color: #7fe0d4;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+}
+
+.folder-year-group .folder-link {
+  min-height: 31px;
+  padding: 6px 9px;
+  font-size: 12px;
+}
+
+.folder-empty {
+  color: #b8c0cc;
+  font-size: 12px;
+  font-style: normal;
 }
 
 .folder-create {
@@ -510,11 +588,14 @@ label span {
 }
 
 .firebase-note {
+  flex: 0 0 auto;
+  position: static;
+  z-index: 3;
   margin-top: auto;
   border: 1px solid #344054;
   border-radius: 16px;
   padding: 15px;
-  background: rgba(255, 255, 255, 0.045);
+  background: rgba(12, 27, 43, 0.96);
   color: #d0d5dd;
   font-size: 12px;
   line-height: 1.35;
@@ -595,6 +676,7 @@ label span {
 
 .workspace {
   min-width: 0;
+  margin-left: 286px;
   padding: 26px;
 }
 
@@ -721,6 +803,25 @@ label span {
   color: var(--muted);
   font-size: 11px;
   line-height: 1.35;
+}
+
+.field-error {
+  display: block;
+  margin-top: 6px;
+  color: #b42318;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+label.has-error input {
+  border-color: #f04438;
+  background: #fff7f7;
+}
+
+label.has-error input:focus {
+  border-color: #d92d20;
+  box-shadow: 0 0 0 3px rgba(217, 45, 32, 0.14);
 }
 
 .reset-password {
@@ -1203,6 +1304,37 @@ label span {
   min-width: 180px;
 }
 
+.class-search {
+  border: 1px solid #d7e3ea;
+  border-radius: 16px;
+  background: #f8fbfd;
+  padding: 14px;
+}
+
+.compact-heading {
+  margin-bottom: 10px;
+}
+
+.compact-heading h2 {
+  font-size: 16px;
+}
+
+.compact-heading p {
+  font-size: 12px;
+}
+
+.class-search-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.class-search-grid button {
+  min-width: 120px;
+  margin-bottom: 0;
+}
+
 .model-actions {
   display: flex;
   flex-wrap: wrap;
@@ -1258,11 +1390,24 @@ label span {
 
 .class-card {
   display: grid;
-  min-height: 112px;
-  align-content: center;
-  justify-items: start;
+  gap: 8px;
+  min-height: 132px;
+  align-content: stretch;
+  justify-items: stretch;
   border-color: #d7e3ea;
   background: linear-gradient(135deg, #ffffff 0%, #effaf7 100%);
+  padding: 10px;
+  text-align: left;
+}
+
+.class-card-open {
+  display: grid;
+  min-height: 92px;
+  align-content: center;
+  justify-items: start;
+  border: 0;
+  background: transparent;
+  padding: 0;
   text-align: left;
 }
 
@@ -1281,6 +1426,28 @@ label span {
   color: #667085;
   font-size: 12px;
   font-weight: 700;
+}
+
+.class-card em {
+  margin-top: 4px;
+  color: #475467;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.class-delete {
+  min-height: 34px;
+  border-color: #fecdca;
+  background: #fff3f2;
+  color: #b42318;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.class-delete:hover {
+  border-color: #fda29b;
+  background: #fee4e2;
 }
 
 .activity-screen {
@@ -2381,6 +2548,30 @@ label span {
   display: none;
 }
 
+.pdf-export-only {
+  position: fixed;
+  top: 0;
+  left: -10000px;
+  z-index: -1;
+  width: 794px;
+  height: auto;
+  overflow: hidden;
+  pointer-events: none;
+  background: #ffffff;
+}
+
+.pdf-export-only .paper,
+.pdf-export-only .document-page {
+  width: 794px;
+  height: 1123px;
+  min-height: 1123px;
+  max-height: 1123px;
+  margin: 0;
+  box-shadow: none !important;
+  overflow: hidden;
+  transform: none !important;
+}
+
 .preview-toolbar {
   justify-content: space-between;
   border-bottom: 1px solid var(--line);
@@ -3097,7 +3288,16 @@ label span {
   height: 128px;
   max-width: 100%;
   max-height: 100%;
+  background: transparent;
+  filter: none;
+  image-rendering: auto;
+  mix-blend-mode: normal;
   object-fit: contain;
+  opacity: 1;
+}
+
+.history-logo-image {
+  image-rendering: auto;
 }
 
 .doc-grid {
@@ -4433,16 +4633,25 @@ label span {
 
 @media (max-width: 1180px) {
   .app-shell {
+    display: grid;
     grid-template-columns: 1fr;
   }
 
   .sidebar {
     position: sticky;
+    inset: auto;
     top: 0;
     z-index: 10;
     flex-direction: row;
     align-items: center;
+    height: auto;
+    min-height: 0;
     overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  .workspace {
+    margin-left: 0;
   }
 
   .brand {
@@ -4898,14 +5107,24 @@ label span {
     display: block !important;
     background: transparent !important;
     height: auto !important;
-    mix-blend-mode: multiply !important;
+    mix-blend-mode: normal !important;
     object-fit: contain !important;
   }
 
   .print-only .header-empty-box img,
   .print-only .signature-stamp {
     background: transparent !important;
-    mix-blend-mode: multiply !important;
+    mix-blend-mode: normal !important;
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+
+  .print-only .history-logo-image {
+    background: transparent !important;
+    filter: none !important;
+    image-rendering: auto !important;
+    mix-blend-mode: normal !important;
+    opacity: 1 !important;
     print-color-adjust: exact;
     -webkit-print-color-adjust: exact;
   }
